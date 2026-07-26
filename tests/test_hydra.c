@@ -40,6 +40,8 @@ static uint32_t rnd(void)
 static uint32_t rnd_below(uint32_t n) { return n ? rnd() % n : 0; }
 
 /* ---- the core check ------------------------------------------------------ */
+static int g_blind = 0;
+
 static int check_roundtrip(const uint8_t *data, size_t n, int level, const char *what)
 {
     hydra_opts o;
@@ -51,6 +53,7 @@ static int check_roundtrip(const uint8_t *data, size_t n, int level, const char 
     snprintf(g_case, sizeof(g_case), "%s n=%lu L%d", what, (unsigned long)n, level);
 
     hydra_opts_init(&o, level);
+    o.blind = g_blind;
     cap = hydra_bound(n);
     cbuf = (uint8_t *)malloc(cap);
     dbuf = (uint8_t *)malloc(n ? n : 1);
@@ -640,6 +643,16 @@ int main(void)
     test_adversarial();
     test_random_fuzz();
     test_corruption();
+
+    /* Re-run the content suite with content inspection switched off.
+     * The blind path picks filters by racing them rather than by analysing
+     * the data, so it reaches filter combinations the analyser never
+     * proposes -- and those combinations have to unfilter correctly too. */
+    printf("\n== repeating generated content with --blind ==\n");
+    g_blind = 1;
+    test_generators();
+    test_multiblock_filters();
+    g_blind = 0;
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

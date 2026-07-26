@@ -88,6 +88,7 @@ void hydra_opts_init(hydra_opts *o, int level)
     o->verbose      = 0;
     o->threads      = 0;
     o->enable_sgi   = 1;
+    o->blind        = 0;
 }
 
 /* Choose the block size.
@@ -176,6 +177,92 @@ static void bhdr_write(uint8_t *p, const hz_bhdr *h)
 /* =========================================================================
  * Compression
  * ========================================================================= */
+/* ---- blind configuration race ------------------------------------------
+ *
+ * The alternative to inspecting the data: do not look at it at all.  Run a
+ * fixed slate of filter combinations on a slice, keep whichever produced the
+ * fewest bytes, and apply that to the block.
+ *
+ * The appeal is not speed -- this is slower than a heuristic -- it is that
+ * the answer cannot be wrong in the way a heuristic is wrong.  Three times
+ * in this codec's history an analyser confidently reported structure that
+ * measurement then contradicted: delta on smooth images (cost 5.4%), long
+ * range dedup on a SQL dump (20.6x became 17.3x), a decimal point beating a
+ * newline as the record separator.  Each needed a targeted fix.  A race has
+ * no opinion to be wrong about; it only reports which output was smaller.
+ *
+ * It also finds combinations no analyser proposed.  On 16-bit stereo audio
+ * the heuristic picks delta-4; the race picks transpose-4 followed by
+ * delta-1, because it never had a theory about what audio "should" want.
+ *
+ * The slate is deliberately small and fixed.  It covers the transforms this
+ * codec implements, in the pairings that are meaningful: a transpose groups
+ * a record's columns together, so a delta *after* one runs down a column
+ * rather than across a row, and those two orders behave completely
+ * differently. */
+typedef struct {
+    uint8_t shuf;      /* transpose width, 0 = none */
+    uint8_t delta;     /* delta stride, 0 = none    */
+    uint8_t exe;       /* x86 branch filter         */
+    uint8_t lrm;       /* long range dedup          */
+} hz_recipe;
+
+static const hz_recipe HZ_SLATE[] = {
+    { 0, 0, 0, 0 },   /* nothing                                        */
+    { 0, 0, 0, 1 },   /* dedup only                                     */
+    { 0, 1, 0, 0 },   /* byte delta: smooth 8-bit signals, images       */
+    { 0, 2, 0, 0 },   /* 16-bit mono                                    */
+    { 0, 4, 0, 0 },   /* 16-bit stereo / 32-bit                         */
+    { 2, 0, 0, 0 },   /* transpose 2                                    */
+    { 4, 0, 0, 0 },   /* transpose 4                                    */
+    { 8, 0, 0, 0 },   /* transpose 8: float64 arrays, wide records      */
+    { 4, 1, 0, 0 },   /* transpose then delta down each column          */
+    { 8, 1, 0, 0 },
+    { 2, 1, 0, 0 },
+    { 0, 0, 1, 0 },   /* x86 branches                                   */
+    { 0, 0, 1, 1 },   /* x86 branches plus dedup                        */
+    { 8, 0, 0, 1 },   /* dedup then transpose                           */
+    { 0, 1, 0, 1 },   /* dedup then delta                               */
+};
+#define HZ_NSLATE ((int)(sizeof(HZ_SLATE) / sizeof(HZ_SLATE[0])))
+
+/* Apply one recipe to `dst` (which already holds a copy of the input).
+ * Returns the resulting length, or 0 if the recipe does not apply. */
+static size_t hz_recipe_apply(const hz_recipe *r, uint8_t *dst, size_t len,
+                              uint8_t *scratch, size_t scratch_cap,
+                              hz_bhdr *h)
+{
+    if (r->lrm) {
+        size_t l = hz_lrm_fwd(scratch, scratch_cap, dst, len);
+        if (!l || l >= len) return 0;          /* no long range structure */
+        memcpy(dst, scratch, l);
+        len = l;
+        h->fid[h->nfilters] = HZ_F_LRM;
+        h->fparam[h->nfilters] = 0;
+        ++h->nfilters;
+    }
+    if (r->shuf) {
+        if (len < (size_t)r->shuf * 64) return 0;
+        hz_shuf_fwd(dst, scratch, len, r->shuf);
+        h->fid[h->nfilters] = HZ_F_SHUF;
+        h->fparam[h->nfilters] = r->shuf;
+        ++h->nfilters;
+    }
+    if (r->exe) {
+        hz_exe_fwd(dst, len);
+        h->fid[h->nfilters] = HZ_F_EXE;
+        h->fparam[h->nfilters] = 0;
+        ++h->nfilters;
+    }
+    if (r->delta) {
+        hz_delta_fwd(dst, len, r->delta);
+        h->fid[h->nfilters] = HZ_F_DELTA;
+        h->fparam[h->nfilters] = r->delta;
+        ++h->nfilters;
+    }
+    return len;
+}
+
 /* ---- per-block compression job -----------------------------------------
  * Everything a block needs is either read-only (the source, the options) or
  * private to the worker (three scratch buffers and an output buffer), so
@@ -301,154 +388,201 @@ static void hz_compress_block(void *vctx, int index)
         }
 
         /* ---- pick filters ---- */
-        hz_analyze(blk, n, &an);
 
-        /* Filtering needs a private copy; the input is const. */
-        if (n > work_cap) { jb->err = HYDRA_E_INTERNAL; return; }
-        memcpy(work, blk, n);
-        stage = work;
+        if (opts->blind) {
+            /* Race the slate: no inspection, just measurement.
+             *
+             * Each recipe is applied to a slice and coded; the cheapest wins
+             * and is then applied to the whole block.  A slice rather than
+             * the block keeps the cost bounded -- the race is O(slate) coder
+             * runs, and on a 16 MiB block that would otherwise dominate. */
+            size_t probe = hz_minz(n, (size_t)1 << 17);
+            size_t off   = (n - probe) / 2;
+            int    bi = 0, k;
+            size_t bbytes = (size_t)-1;
 
-        /* Long range de-duplication, decided by measurement.
-         *
-         * Removing a distant repeat is not automatically a win.  The context
-         * models can code a repeat that is *within* their reach for far less
-         * than an explicit length-and-distance pair costs, and pulling it out
-         * also strips the surrounding context they were using to predict.
-         * Measured on a SQL dump full of near-identical statements, the
-         * filter turned 20.6x into 17.3x.
-         *
-         * So the filter only survives if a probe says it earns its place.
-         * The probe compresses a slice of the raw block and the same slice
-         * of the de-duplicated block, and the comparison is per input byte
-         * because the two slices cover different amounts of original data. */
-        if (opts->enable_lrm && an.lrm_worth && h.nfilters + 1 < HZ_MAX_FILTERS) {
-            size_t l = hz_lrm_fwd(tmp, work_cap, stage, stage_len);
-            int keep = 0;
+            for (k = 0; k < HZ_NSLATE; ++k) {
+                hz_bhdr th;
+                size_t plen, cost;
+                memset(&th, 0, sizeof(th));
+                memcpy(tmp, blk + off, probe);
+                plen = hz_recipe_apply(&HZ_SLATE[k], tmp, probe,
+                                       shufbuf, work_cap, &th);
+                if (!plen) continue;
+                cost = hz_probe_cost(work, work_cap, tmp, plen,
+                                     block_method, opts->level);
+                if (cost && cost < bbytes) { bbytes = cost; bi = k; }
+            }
 
-            if (l && l + l / 16 < stage_len) {
-                size_t probe_raw = hz_minz(stage_len, (size_t)1 << 19);
-                size_t probe_lrm = hz_minz(l, (size_t)1 << 19);
+            memcpy(work, blk, n);
+            stage = work;
+            stage_len = hz_recipe_apply(&HZ_SLATE[bi], stage, n,
+                                        shufbuf, work_cap, &h);
+            if (!stage_len) {
+                /* the winning recipe declined at full size; fall back to
+                 * the identity, which is always applicable */
+                memset(&h, 0, sizeof(h));
+                memcpy(work, blk, n);
+                stage = work;
+                stage_len = n;
+            }
+            if (opts->verbose)
+                fprintf(stderr, "[hydra] blind race picked recipe %d "
+                        "(shuf=%d delta=%d exe=%d lrm=%d)\n", bi,
+                        HZ_SLATE[bi].shuf, HZ_SLATE[bi].delta,
+                        HZ_SLATE[bi].exe, HZ_SLATE[bi].lrm);
+        } else {
+            hz_analyze(blk, n, &an);
 
-                if (probe_raw >= 8192 && probe_lrm >= 4096 &&
-                    work_cap > probe_raw + probe_lrm + 65536) {
-                    /* cost per byte of *original* data in each form */
-                    size_t c_raw = hz_probe_cost(shufbuf, work_cap,
-                                                 stage, probe_raw,
-                                                 block_method, opts->level);
-                    size_t c_lrm = hz_probe_cost(shufbuf, work_cap,
-                                                 tmp, probe_lrm,
-                                                 block_method, opts->level);
-                    if (c_raw && c_lrm) {
-                        /* scale the de-duplicated cost back to the same span
-                         * of source bytes: probe_lrm bytes of filtered data
-                         * stand for probe_lrm * (stage_len / l) originals */
-                        double span_lrm = (double)probe_lrm * (double)stage_len / (double)l;
-                        double per_raw  = (double)c_raw / (double)probe_raw;
-                        double per_lrm  = (double)c_lrm / span_lrm;
-                        keep = per_lrm < per_raw * 0.98;
+            /* Filtering needs a private copy; the input is const. */
+            if (n > work_cap) { jb->err = HYDRA_E_INTERNAL; return; }
+            memcpy(work, blk, n);
+            stage = work;
+
+            /* Long range de-duplication, decided by measurement.
+             *
+             * Removing a distant repeat is not automatically a win.  The context
+             * models can code a repeat that is *within* their reach for far less
+             * than an explicit length-and-distance pair costs, and pulling it out
+             * also strips the surrounding context they were using to predict.
+             * Measured on a SQL dump full of near-identical statements, the
+             * filter turned 20.6x into 17.3x.
+             *
+             * So the filter only survives if a probe says it earns its place.
+             * The probe compresses a slice of the raw block and the same slice
+             * of the de-duplicated block, and the comparison is per input byte
+             * because the two slices cover different amounts of original data. */
+            if (opts->enable_lrm && an.lrm_worth && h.nfilters + 1 < HZ_MAX_FILTERS) {
+                size_t l = hz_lrm_fwd(tmp, work_cap, stage, stage_len);
+                int keep = 0;
+
+                if (l && l + l / 16 < stage_len) {
+                    size_t probe_raw = hz_minz(stage_len, (size_t)1 << 19);
+                    size_t probe_lrm = hz_minz(l, (size_t)1 << 19);
+
+                    if (probe_raw >= 8192 && probe_lrm >= 4096 &&
+                        work_cap > probe_raw + probe_lrm + 65536) {
+                        /* cost per byte of *original* data in each form */
+                        size_t c_raw = hz_probe_cost(shufbuf, work_cap,
+                                                     stage, probe_raw,
+                                                     block_method, opts->level);
+                        size_t c_lrm = hz_probe_cost(shufbuf, work_cap,
+                                                     tmp, probe_lrm,
+                                                     block_method, opts->level);
+                        if (c_raw && c_lrm) {
+                            /* scale the de-duplicated cost back to the same span
+                             * of source bytes: probe_lrm bytes of filtered data
+                             * stand for probe_lrm * (stage_len / l) originals */
+                            double span_lrm = (double)probe_lrm * (double)stage_len / (double)l;
+                            double per_raw  = (double)c_raw / (double)probe_raw;
+                            double per_lrm  = (double)c_lrm / span_lrm;
+                            keep = per_lrm < per_raw * 0.98;
+                        }
+                    } else {
+                        keep = 1;   /* too small to probe meaningfully */
                     }
-                } else {
-                    keep = 1;   /* too small to probe meaningfully */
+                }
+
+                if (keep) {
+                    memcpy(work, tmp, l);
+                    stage_len = l;
+                    h.fid[h.nfilters] = HZ_F_LRM;
+                    h.fparam[h.nfilters] = 0;
+                    ++h.nfilters;
                 }
             }
 
-            if (keep) {
-                memcpy(work, tmp, l);
-                stage_len = l;
-                h.fid[h.nfilters] = HZ_F_LRM;
+            if (opts->enable_exe && an.is_x86 && h.nfilters + 1 < HZ_MAX_FILTERS) {
+                hz_exe_fwd(stage, stage_len);
+                h.fid[h.nfilters] = HZ_F_EXE;
                 h.fparam[h.nfilters] = 0;
                 ++h.nfilters;
             }
-        }
+            /* Byte transpose, decided the same way: by measurement.  It runs
+             * before delta so that any delta afterwards operates within a
+             * column, which is what makes the pair effective on numeric arrays. */
+            if (opts->enable_delta && an.best_shuffle_width &&
+                h.nfilters + 1 < HZ_MAX_FILTERS) {
+                int w = an.best_shuffle_width;
+                size_t probe = hz_minz(stage_len, (size_t)1 << 19);
+                size_t off   = (stage_len - probe) / 2;
+                int use_shuf = 0;
 
-        if (opts->enable_exe && an.is_x86 && h.nfilters + 1 < HZ_MAX_FILTERS) {
-            hz_exe_fwd(stage, stage_len);
-            h.fid[h.nfilters] = HZ_F_EXE;
-            h.fparam[h.nfilters] = 0;
-            ++h.nfilters;
-        }
-        /* Byte transpose, decided the same way: by measurement.  It runs
-         * before delta so that any delta afterwards operates within a
-         * column, which is what makes the pair effective on numeric arrays. */
-        if (opts->enable_delta && an.best_shuffle_width &&
-            h.nfilters + 1 < HZ_MAX_FILTERS) {
-            int w = an.best_shuffle_width;
-            size_t probe = hz_minz(stage_len, (size_t)1 << 19);
-            size_t off   = (stage_len - probe) / 2;
-            int use_shuf = 0;
-
-            probe -= probe % (size_t)w;
-            if (probe >= 8192) {
-                size_t half = work_cap / 2;
-                if (half > probe + 8192) {
-                    size_t plain_c = hz_probe_cost(pb_lo(tmp, half), half,
-                                                   stage + off, probe,
-                                                   block_method, opts->level);
-                    memcpy(tmp + half, stage + off, probe);
-                    hz_shuf_fwd(tmp + half, shufbuf, probe, w);
-                    {
-                        size_t shuf_c = hz_probe_cost(pb_lo(tmp, half), half,
-                                                      tmp + half, probe,
-                                                      block_method, opts->level);
-                        if (plain_c && shuf_c)
-                            use_shuf = (shuf_c + shuf_c / 64) < plain_c;
+                probe -= probe % (size_t)w;
+                if (probe >= 8192) {
+                    size_t half = work_cap / 2;
+                    if (half > probe + 8192) {
+                        size_t plain_c = hz_probe_cost(pb_lo(tmp, half), half,
+                                                       stage + off, probe,
+                                                       block_method, opts->level);
+                        memcpy(tmp + half, stage + off, probe);
+                        hz_shuf_fwd(tmp + half, shufbuf, probe, w);
+                        {
+                            size_t shuf_c = hz_probe_cost(pb_lo(tmp, half), half,
+                                                          tmp + half, probe,
+                                                          block_method, opts->level);
+                            if (plain_c && shuf_c)
+                                use_shuf = (shuf_c + shuf_c / 64) < plain_c;
+                        }
                     }
                 }
-            }
-            if (use_shuf) {
-                hz_shuf_fwd(stage, shufbuf, stage_len, w);
-                h.fid[h.nfilters] = HZ_F_SHUF;
-                h.fparam[h.nfilters] = (uint8_t)w;
-                ++h.nfilters;
-            }
-        }
-
-        /* Delta is the one filter whose benefit cannot be predicted reliably
-         * from the data alone.  A residual with lower order-0 entropy still
-         * loses whenever the context models were already exploiting the
-         * original byte structure -- smooth images are the standard example:
-         * the entropy test says yes, and measuring says it costs 5%.
-         *
-         * So do not guess.  Trial encode a slice both ways and keep the
-         * winner.  The slice is small enough that the extra work is a few
-         * percent of the block, and it converts a heuristic that is wrong
-         * on real data into a decision that is right by construction. */
-        if (opts->enable_delta && an.best_delta_stride &&
-            h.nfilters + 1 < HZ_MAX_FILTERS) {
-            int use_delta = 1;
-            /* Probe a slice from the middle of the block: the start is
-             * often a header or a warm-up region that behaves nothing like
-             * the bulk, and judging the whole block by it is how the
-             * previous heuristic went wrong. */
-            size_t probe = hz_minz(stage_len, (size_t)1 << 19);
-            size_t off   = (stage_len - probe) / 2;
-
-            if (probe >= 4096) {
-                size_t plain_c, delta_c;
-                uint8_t *pb = tmp;
-                size_t half = work_cap / 2;
-
-                if (half > probe + 8192) {
-                    plain_c = hz_probe_cost(pb, half, stage + off, probe,
-                                            block_method, opts->level);
-                    memcpy(pb + half, stage + off, probe);
-                    hz_delta_fwd(pb + half, probe, an.best_delta_stride);
-                    delta_c = hz_probe_cost(pb, half, pb + half, probe,
-                                            block_method, opts->level);
-                    /* Require a clear win: the filter costs a pass over the
-                     * data and adds a header, so a coin-flip margin is not
-                     * worth taking. */
-                    if (plain_c && delta_c)
-                        use_delta = (delta_c + delta_c / 64) < plain_c;
+                if (use_shuf) {
+                    hz_shuf_fwd(stage, shufbuf, stage_len, w);
+                    h.fid[h.nfilters] = HZ_F_SHUF;
+                    h.fparam[h.nfilters] = (uint8_t)w;
+                    ++h.nfilters;
                 }
             }
 
-            if (use_delta) {
-                hz_delta_fwd(stage, stage_len, an.best_delta_stride);
-                h.fid[h.nfilters] = HZ_F_DELTA;
-                h.fparam[h.nfilters] = (uint8_t)an.best_delta_stride;
-                ++h.nfilters;
+            /* Delta is the one filter whose benefit cannot be predicted reliably
+             * from the data alone.  A residual with lower order-0 entropy still
+             * loses whenever the context models were already exploiting the
+             * original byte structure -- smooth images are the standard example:
+             * the entropy test says yes, and measuring says it costs 5%.
+             *
+             * So do not guess.  Trial encode a slice both ways and keep the
+             * winner.  The slice is small enough that the extra work is a few
+             * percent of the block, and it converts a heuristic that is wrong
+             * on real data into a decision that is right by construction. */
+            if (opts->enable_delta && an.best_delta_stride &&
+                h.nfilters + 1 < HZ_MAX_FILTERS) {
+                int use_delta = 1;
+                /* Probe a slice from the middle of the block: the start is
+                 * often a header or a warm-up region that behaves nothing like
+                 * the bulk, and judging the whole block by it is how the
+                 * previous heuristic went wrong. */
+                size_t probe = hz_minz(stage_len, (size_t)1 << 19);
+                size_t off   = (stage_len - probe) / 2;
+
+                if (probe >= 4096) {
+                    size_t plain_c, delta_c;
+                    uint8_t *pb = tmp;
+                    size_t half = work_cap / 2;
+
+                    if (half > probe + 8192) {
+                        plain_c = hz_probe_cost(pb, half, stage + off, probe,
+                                                block_method, opts->level);
+                        memcpy(pb + half, stage + off, probe);
+                        hz_delta_fwd(pb + half, probe, an.best_delta_stride);
+                        delta_c = hz_probe_cost(pb, half, pb + half, probe,
+                                                block_method, opts->level);
+                        /* Require a clear win: the filter costs a pass over the
+                         * data and adds a header, so a coin-flip margin is not
+                         * worth taking. */
+                        if (plain_c && delta_c)
+                            use_delta = (delta_c + delta_c / 64) < plain_c;
+                    }
+                }
+
+                if (use_delta) {
+                    hz_delta_fwd(stage, stage_len, an.best_delta_stride);
+                    h.fid[h.nfilters] = HZ_F_DELTA;
+                    h.fparam[h.nfilters] = (uint8_t)an.best_delta_stride;
+                    ++h.nfilters;
+                }
             }
+
+
         }
 
         h.usize = (uint32_t)n;

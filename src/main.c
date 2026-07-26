@@ -67,7 +67,7 @@ static void usage(void)
     fprintf(stderr,
         "%s\n"
         "usage:\n"
-        "  hydra c [-1..-9] [-v] [--no-filters] IN OUT   compress\n"
+        "  hydra c [-1..-9] [-v] [--blind] [--no-filters] IN OUT   compress\n"
         "  hydra d IN OUT                                decompress\n"
         "  hydra t [-1..-9] FILE                         verify round trip\n"
         "  hydra b FILE                                  benchmark all levels\n",
@@ -94,6 +94,7 @@ static int cmd_compress(int argc, char **argv)
         else if (!strcmp(argv[i], "--no-filters"))
             o.enable_delta = o.enable_exe = o.enable_lrm = 0;
         else if (!strcmp(argv[i], "--no-checksum")) o.checksum = 0;
+        else if (!strcmp(argv[i], "--blind")) o.blind = 1;
         else if (!fin) fin = argv[i];
         else fout = argv[i];
     }

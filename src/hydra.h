@@ -58,6 +58,7 @@ typedef struct {
     int      verbose;      /* emit per-block diagnostics on stderr         */
     int      threads;      /* 0 = auto (one per core), 1 = single threaded */
     int      enable_sgi;   /* allow structural grammar induction           */
+    int      blind;        /* 0 = inspect content, 1 = race configurations */
 } hydra_opts;
 
 /* Number of usable cores, as hydra would pick with threads = 0. */

@@ -62,3 +62,12 @@ $(BINDIR)/bench_mem: bench/bench_mem.c $(LIB) | $(BINDIR)
 
 benchmem: $(BINDIR)/bench_mem
 	@for f in $(CORPUS)/*; do ./$(BINDIR)/bench_mem $$f; done
+
+$(BINDIR)/proof: tools/proof.c $(LIB) | $(BINDIR)
+	$(CC) $(CFLAGS) -D_POSIX_C_SOURCE=199309L -I$(SRCDIR) $< $(LIB) -o $@ $(LDFLAGS)
+
+proof: $(BINDIR)/proof
+	./$(BINDIR)/proof 5 3
+
+$(BINDIR)/proof2: tools/proof2.c $(LIB) | $(BINDIR)
+	$(CC) $(CFLAGS) -D_POSIX_C_SOURCE=199309L -I$(SRCDIR) $< $(LIB) -o $@ $(LDFLAGS)

@@ -225,6 +225,43 @@ Reversible preprocessing, each an exact bijection:
 - **exe** — x86 E8/E9 relative branch targets to absolute
 - **lrm** — de-duplicate repeats beyond the entropy coder's reach
 
+### `--blind`: choose filters without looking at the data at all
+
+There is a second way to pick filters, and it came from asking a simple
+question: what if the compressor never inspects the content?
+
+In `--blind` mode nothing is analysed. A fixed slate of 15 filter recipes is
+run against a slice of the block, each one coded, and whichever produced the
+fewest bytes is applied. The codec never forms an opinion about whether it is
+looking at text or audio or a database page.
+
+Two things fall out of it:
+
+- **A race cannot be wrong the way a heuristic is wrong.** Three separate
+  analysers in this codec confidently reported structure that measurement
+  then contradicted — see below. Each needed a targeted fix. A race has no
+  theory to be wrong about.
+- **It finds pairings no analyser proposed.** On 16-bit stereo audio the
+  analyser picks delta-4; the race picks *transpose-4 then delta-1*, because
+  it has no idea what audio "should" want. That is 4.75% smaller.
+
+| file (2 MiB slice) | inspecting | `--blind` | |
+|---|---|---|---|
+| audio.pcm | 1,258,005 | **1,198,252** | −4.75% |
+| series.f64 | 1,532,390 | **1,516,584** | −1.03% |
+| image.gray | 991,836 | 991,836 | — |
+| db.pages | 554,297 | 554,297 | — |
+| text.txt | 538,485 | 538,485 | — |
+| binary.exe | 1,202,246 | 1,202,246 | — |
+
+It is not slower, either — on audio it is *faster* (0.41s vs 0.51s), because
+a race of short probes costs less than analysis plus the long probes the
+analyser then triggers.
+
+The default stays on inspection: it wins on nothing here but costs less on
+the common case where no filter applies. `--blind` is the better choice when
+you do not know what you are compressing, which is most of the time.
+
 ### Filters are chosen by measurement, not heuristics
 
 This turned out to matter more than any single modelling change. Every
