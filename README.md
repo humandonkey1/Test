@@ -386,6 +386,46 @@ because the copies are enormous and the source stays in L1.
 Fuzz: 385 accepted cases plus every size from 0 to 4095, zero failures,
 clean under AddressSanitizer and UBSan.
 
+### Real media and real binaries
+
+Tested on files of the kinds actually stored: a RIFF WAV, a 24-bit BMP, a
+JPEG-shaped file with real marker structure, an MP4-shaped box container,
+and two genuine ELF binaries taken off this machine.
+
+| file | size | xz -9e | bzip2 -9 | **hydra -7** | vs xz |
+|---|---|---|---|---|---|
+| image.bmp | 2,359,350 | 63,224 | 56,723 | **61,225** (38.5x) | −3.2% |
+| audio.wav | 1,411,244 | 863,624 | 1,312,054 | **688,665** (2.05x) | **−20.3%** |
+| gcc.bin (ELF) | 1,301,496 | **407,564** | 477,715 | 426,945 (3.05x) | +4.8% |
+| libc.bin (ELF) | 1,926,232 | **694,696** | 836,956 | 769,827 (2.50x) | +10.8% |
+| photos.jpg | 1,529,971 | 1,530,108 | 1,530,675 | **1,530,008** (1.00x) | −0.0% |
+| video.mp4 | 3,302,432 | 3,302,660 | 3,313,206 | **3,302,469** (1.00x) | −0.0% |
+
+Wins on audio by 20%, loses on ELF binaries by 5–11%, ties on
+already-compressed payloads — which is the correct answer there, since a
+JPEG's entropy coder has already taken what a second pass could find.
+
+RCD declines every one of these: a single photo or executable has no
+large-scale duplication to distil, and it says so rather than expanding the
+input.
+
+**Why the ELF loss is real and where it lives.** Diagnostics on libc: the
+match model is active on only 24.1% of bytes, against 81.9% on source code —
+though when it does fire it is 87% correct. Machine code repeats in short
+fragments, and the acceptance threshold was rejecting them.
+
+Lowering that threshold was tried and *measured on both sides*: at 5 bytes
+libc improves from 2.502x to 2.539x, and English text collapses from 6.537x
+to 6.171x. A short accidental match in prose is usually wrong, and the mixer
+pays capacity to distrust it. The threshold is therefore adaptive but
+**one-directional** — it rises where matches keep dying and never falls,
+because falling is what costs. The 1.5% available on binaries was not worth
+5.6% of text.
+
+An order-5 context was also added and reverted; conditional entropy on libc
+falls steeply through order 4 (6.30 → 1.21 bits), which suggested a gap, but
+measuring showed no gain on any file.
+
 ### Against ZPAQ
 
 ZPAQ is the closest comparable design — also context mixing, also general
