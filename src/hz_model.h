@@ -22,7 +22,14 @@
  * so the model can still track drift.                                     */
 typedef uint32_t hz_ctr;
 
-#define HZ_CTR_INIT      (2048u << 10)     /* p = 0.5, n = 0 */
+/* p = 0.5, n = 0.
+ *
+ * The probability occupies the high 22 bits, so a half is 2^21 in that
+ * field and the packed value is (2^21 << 10) = 2^31.  Writing 2048 here --
+ * a half at 12 bits, which is what the field used to be -- left every
+ * counter starting at p16 = 32 instead of 32768, a thousandfold bias toward
+ * zero that the model then had to spend real bits unlearning. */
+#define HZ_CTR_INIT      (2097152u << 10)
 #define HZ_CTR_CNTMAX    1023u
 #define HZ_CTR_P(c)      ((int)((c) >> 10))          /* Q22 -> Q12 base */
 #define HZ_CTR_N(c)      ((int)((c) & HZ_CTR_CNTMAX))

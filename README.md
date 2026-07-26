@@ -37,8 +37,8 @@ was tuned against data the compressor had already seen.
 
 | | gzip -9 | bzip2 -9 | xz -9e | **hydra -7** |
 |---|---|---|---|---|
-| total out | 23,266,828 | 20,592,701 | 19,652,600 | **17,320,193** |
-| ratio | 1.934x | 2.185x | 2.290x | **2.598x** |
+| total out | 23,266,828 | 20,592,701 | 19,652,600 | **17,314,600** |
+| ratio | 1.934x | 2.185x | 2.290x | **2.599x** |
 
 **11.9% smaller than `xz -9e`**, winning on 10 of the 11 files.
 
@@ -64,8 +64,8 @@ Where structure actually repeats, which is what most real archives look like:
 
 | file | size | gzip -9 | xz -9e | **hydra -7** |
 |---|---|---|---|---|
-| telemetry.csv | 16.4 MB | 145x | 5,138x | **22,073x** |
-| backups.bin (64 near-identical 1 MiB images) | 67 MB | 1.0x | **63.1x** | 59.4x |
+| telemetry.csv | 16.4 MB | 145x | 5,138x | **18,679x** |
+| backups.bin (64 near-identical 1 MiB images) | 67 MB | 1.0x | **63.1x** | 60.3x |
 | dump.sql | 19.0 MB | 11.9x | 18.5x | **20.6x** |
 | access.log | 15.1 MB | 7.2x | 9.7x | **11.3x** |
 | vm.img | 13.1 MB | 1.0x | **6.0x** | 5.9x |
@@ -190,6 +190,14 @@ Bugs this suite caught, all of which round-tripped fine on casual input:
 - **`nfilters == HZ_MAX_FILTERS` accepted** on a corrupted header, indexing
   one past the end of the array.
 
+- **every counter started a thousandfold biased.** `HZ_CTR_INIT` was written
+  as `2048 << 10`, a half for a 12-bit probability field — but the field is
+  22 bits, so a half is `2097152 << 10`. Counters began at p16 = 32 instead
+  of 32768 and had to spend real bits unlearning it. The STRONG engine was
+  *expanding* input 2.4x when called directly; it only looked fine inside
+  the container because the RAW fallback silently swallowed the failure.
+  One constant took 64 KiB of text from 165,901 bytes to **26,205**.
+
 Two more that cost ratio rather than correctness:
 
 - **integer truncation froze the counters.** `(target - p) * rate >> 16`
@@ -201,6 +209,12 @@ Two more that cost ratio rather than correctness:
   one lagging stage at 0.999 drags a 0.99999 consensus down by an order of
   magnitude in cost. Averaging logits instead was ~9x better on repetitive
   text.
+- **the long range matcher used a fixed 2^20-slot table.** At stride 4 a
+  64 MiB block inserts 16M positions, so almost every distant repeat was
+  evicted before it could be found. Sizing the table to the input and
+  keeping two candidates per bucket, plus extending matches backwards over
+  bytes already queued as literals, took a near-identical backup set from
+  50.7x to **60.3x**.
 
 ---
 
@@ -228,7 +242,7 @@ bench/           corpus generator, ratio comparison, in-memory timing
   input must expand some other. HYDRA's guarantee is the useful one — a
   block that does not compress is stored raw, so output never exceeds input
   by more than the header.
-- The 22,073x and 59x figures above are real and verified, but they are
+- The 18,679x and 60x figures above are real and verified, but they are
   properties of *redundant data*, not of the codec. Incompressible input
   (`precompressed.z`) comes back at 1.000x, as it must.
 - Level 7–9 encode is under 1 MB/s. That is the price of the model; use

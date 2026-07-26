@@ -221,33 +221,75 @@ size_t hz_lrm_fwd(uint8_t *dst, size_t dst_cap, const uint8_t *src, size_t n)
     uint32_t *tab;
     uint8_t  *op = dst, *omax = dst + dst_cap;
     size_t    i = 0, anchor = 0;
+    int       bits;
+    uint32_t  mask;
 
     if (n < HZ_LRM_MIN * 4) return 0;
 
-    tab = (uint32_t *)calloc((size_t)1 << HZ_LRM_BITS, sizeof(uint32_t));
+    /* Size the table to the number of positions actually hashed.
+     *
+     * A fixed table is the wrong shape here: at stride 4 a 64 MiB block
+     * inserts 16M positions, and into 2^20 slots that is sixteen
+     * overwrites per slot -- almost every distant repeat is evicted before
+     * it can ever be found.  Two slots per inserted position keeps the
+     * occupancy low enough that survival is the common case. */
+    {
+        size_t want = (n / HZ_LRM_STEP) * 2;
+        bits = 16;
+        while (bits < 26 && ((size_t)1 << bits) < want) ++bits;
+    }
+    mask = (uint32_t)(((size_t)1 << bits) - 1);
+
+    /* two candidates per bucket, stored adjacently */
+    tab = (uint32_t *)calloc(((size_t)1 << bits) * 2, sizeof(uint32_t));
     if (!tab) return 0;
 
     while (i + HZ_LRM_MIN <= n) {
-        uint32_t h = hz_hash8(hz_rd64(src + i), HZ_LRM_BITS);
-        uint32_t cand = tab[h];
-        tab[h] = (uint32_t)(i + 1);
+        uint32_t h = hz_hash8(hz_rd64(src + i), 32) & mask;
+        uint32_t *slot = &tab[(size_t)h * 2];
+        size_t best = 0, bestpos = 0;
+        int k;
 
-        if (cand) {
-            size_t cpos = cand - 1, l = 0, maxl = n - i;
-            while (l + 8 <= maxl && hz_rd64(src + cpos + l) == hz_rd64(src + i + l)) l += 8;
+        for (k = 0; k < 2; ++k) {
+            uint32_t cand = slot[k];
+            size_t cpos, l, maxl;
+            if (!cand) continue;
+            cpos = cand - 1;
+            if (cpos >= i) continue;
+            maxl = n - i;
+            l = 0;
+            while (l + 8 <= maxl &&
+                   hz_rd64(src + cpos + l) == hz_rd64(src + i + l)) l += 8;
             while (l < maxl && src[cpos + l] == src[i + l]) ++l;
-            if (l >= HZ_LRM_MIN) {
-                size_t litlen = i - anchor;
-                size_t need = litlen + 40;
-                if ((size_t)(omax - op) < need) { free(tab); return 0; }
-                lrm_put(&op, litlen);
-                memcpy(op, src + anchor, litlen); op += litlen;
-                lrm_put(&op, l);
-                lrm_put(&op, i - cpos);
-                i += l;
-                anchor = i;
-                continue;
+            if (l > best) { best = l; bestpos = cpos; }
+        }
+
+        /* insert, evicting the older of the two entries */
+        slot[1] = slot[0];
+        slot[0] = (uint32_t)(i + 1);
+
+        if (best >= HZ_LRM_MIN) {
+            size_t start = i, cpos = bestpos, l = best, litlen, need;
+
+            /* Extend backwards over bytes already queued as literals.
+             * The probe stride means a repeat is usually first seen a few
+             * bytes after it really began; without this those bytes are
+             * emitted literally and the match is reported short. */
+            while (start > anchor && cpos > 0 &&
+                   src[start - 1] == src[cpos - 1]) {
+                --start; --cpos; ++l;
             }
+
+            litlen = start - anchor;
+            need = litlen + 40;
+            if ((size_t)(omax - op) < need) { free(tab); return 0; }
+            lrm_put(&op, litlen);
+            memcpy(op, src + anchor, litlen); op += litlen;
+            lrm_put(&op, l);
+            lrm_put(&op, start - cpos);
+            i = start + l;
+            anchor = i;
+            continue;
         }
         i += HZ_LRM_STEP;
     }
