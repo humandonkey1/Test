@@ -77,3 +77,6 @@ $(BINDIR)/reorder_study: tools/reorder_study.c $(LIB) | $(BINDIR)
 
 $(BINDIR)/nova: tools/nova.c $(LIB) | $(BINDIR)
 	$(CC) $(CFLAGS) -D_POSIX_C_SOURCE=199309L -I$(SRCDIR) $< $(LIB) -o $@ $(LDFLAGS)
+
+$(BINDIR)/seedsearch: tools/seedsearch.c $(LIB) | $(BINDIR)
+	$(CC) $(CFLAGS) -D_POSIX_C_SOURCE=199309L -I$(SRCDIR) $< $(LIB) -o $@ $(LDFLAGS)

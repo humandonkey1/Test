@@ -345,6 +345,46 @@ remove them, it renames where they sit. Keeping the key outside the archive
 would mean the archive no longer contains the file — the 25 bytes become a
 filename and the filesystem does the work.
 
+### Searching for a KDF seed that regenerates the file
+
+A key derivation function stretches a short password into arbitrarily many
+bytes — 25 in, a megabyte out. So the question is a good one: could we
+*search* for a seed whose derived stream happens to be the target file, and
+ship only the seed?
+
+`tools/seedsearch.c` runs that search for real, with a KDF written here from
+scratch. The seeds it finds are verified to regenerate the bytes they claim.
+
+| bytes matched | attempts | time |
+|---|---|---|
+| 1 | 379 | instant |
+| 2 | 23,154 | 0.003 s |
+| 3 | 3,201,770 | 0.37 s |
+| **4** | **2,635,592,243** | **309 s** |
+| 5 | budget exhausted | not found |
+
+Four bytes took five minutes at 8.5 million seeds/second. Each additional
+byte multiplies the work by 256:
+
+| bytes | expected search time |
+|---|---|
+| 8 | 68,600 years |
+| 10 | 4.5 billion years |
+| 12 | 295 trillion years |
+
+Two walls, and they are independent:
+
+1. **The seed is 25 bytes.** Even with an instant search, nothing is saved
+   until the output exceeds 25 bytes — and the search never gets that far.
+2. **Most files have no seed at all.** A 25-byte seed names at most 256^25
+   streams; there are 256^1048576 files of 1 MiB. The seed space is short by
+   a factor of 256^1048551, so for all but a vanishing fraction there is
+   nothing to find, however long you look.
+
+A KDF is a one-way function *by design*: cheap forward, infeasible backward.
+That property is what makes it useful for passwords, and it is the same
+property that stops it being a compressor.
+
 ### Filters are chosen by measurement, not heuristics
 
 This turned out to matter more than any single modelling change. Every
