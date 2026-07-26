@@ -311,6 +311,40 @@ Where the idea *does* work is below the record, not above it: the byte
 transpose in the filter stage regroups a record's columns and earns its
 place on numeric arrays. Same principle, right granularity.
 
+### The "25-byte body plus a key file" archive: built and measured
+
+Another idea worth building rather than dismissing: what if every file
+became a 25-byte body, and a `nova.key` stored *inside the same archive*
+turned those 25 bytes back into the original?
+
+`tools/nova.c` implements it faithfully, three ways, and verifies the round
+trip. The bodies really are 25 bytes.
+
+On 16 MiB of near-identical backup images:
+
+| key design | body | nova.key | **archive** |
+|---|---|---|---|
+| 1. key holds the file | 25 | 16,777,216 | **16,777,241** |
+| 2. body = digest, key = file XOR keystream | 25 | 16,777,216 | **16,777,241** |
+| 3. key = dictionary of distinct 4 KiB blocks | 16,384 | 2,285,568 | **2,301,952** |
+| hydra -7, no key at all | — | — | **1,090,442** |
+
+Mode 2 is the one that feels like it should work: the body is a digest, the
+key is the file XOR'd with a keystream derived from that digest, so the body
+genuinely participates — without those 25 bytes the key is noise. It round
+trips. It also saves nothing, because the key is the same size as the file.
+
+Mode 3 *does* shrink the archive, 16.7 MB down to 2.3 MB — 4,096 blocks
+collapsed to 558 distinct ones. But that is deduplication, and the saving
+came from the duplication in the data, not from the key. Hydra's long range
+filter already does this inline and gets to 1.09 MB, less than half.
+
+The arithmetic is the same in all three rows: **nova.key ships inside the
+archive, so it counts.** Moving bytes out of the body into the key does not
+remove them, it renames where they sit. Keeping the key outside the archive
+would mean the archive no longer contains the file — the 25 bytes become a
+filename and the filesystem does the work.
+
 ### Filters are chosen by measurement, not heuristics
 
 This turned out to matter more than any single modelling change. Every
