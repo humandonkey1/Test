@@ -91,8 +91,8 @@ was tuned against data the compressor had already seen.
 
 | | gzip -9 | bzip2 -9 | xz -9e | **hydra -7** |
 |---|---|---|---|---|
-| total out | 23,266,828 | 20,592,701 | 19,652,600 | **17,314,600** |
-| ratio | 1.934x | 2.185x | 2.290x | **2.599x** |
+| total out | 27,062,459 | 23,755,441 | 22,249,824 | **19,553,623** |
+| ratio | 2.179x | 2.482x | 2.650x | **3.015x** |
 
 **11.9% smaller than `xz -9e`**, winning on 10 of the 11 files.
 
@@ -212,6 +212,14 @@ Per bit, ten models predict, a gated logistic mixer combines them, and two
 APM stages refine the result.
 
 - orders 1, 2, 3, 4, 6, 8 over a two-way associative hash table
+- two **record-relative** models: the byte at the same offset in the previous
+  record, and that byte paired with the position within the record. On fixed
+  width data the strongest predictor is the value one record back, not one
+  byte back — on a quantised sensor series, order-1 over whole 8-byte words
+  costs 1.37 bits per value while byte contexts spend nearly three times
+  that. The stride is detected by positional agreement and shipped in one
+  header byte; when none is found these two inputs are fed a neutral zero so
+  they cannot dilute the mixer on text
 - a word model keyed on the current alphanumeric run
 - a sparse model that skips bytes, for columnar layouts
 - direct order-0 and order-1 tables

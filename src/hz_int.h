@@ -227,6 +227,7 @@ HZ_INLINE size_t hz_maxz(size_t a, size_t b) { return a > b ? a : b; }
 #define HZ_F_EXE   2
 #define HZ_F_LRM   3
 #define HZ_F_SHUF  4
+#define HZ_F_FXOR  5   /* XOR each fixed-width word with the previous one */
 #define HZ_MAX_FILTERS 6
 
 #define HZ_MAX_THREADS 64
@@ -260,6 +261,8 @@ void   hz_delta_fwd(uint8_t *buf, size_t n, int stride);
 void   hz_delta_rev(uint8_t *buf, size_t n, int stride);
 void   hz_shuf_fwd(uint8_t *buf, uint8_t *scratch, size_t n, int width);
 void   hz_shuf_rev(uint8_t *buf, uint8_t *scratch, size_t n, int width);
+void   hz_fxor_fwd(uint8_t *buf, size_t n, int width);
+void   hz_fxor_rev(uint8_t *buf, size_t n, int width);
 void   hz_exe_fwd(uint8_t *buf, size_t n);
 void   hz_exe_rev(uint8_t *buf, size_t n);
 size_t hz_lrm_fwd(uint8_t *dst, size_t dst_cap, const uint8_t *src, size_t n);
