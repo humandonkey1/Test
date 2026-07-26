@@ -56,7 +56,11 @@ typedef struct {
     int      enable_lrm;   /* allow the long range de-duplicator           */
     int      force_method; /* -1 auto, 0 raw, 1 fast, 2 cm                 */
     int      verbose;      /* emit per-block diagnostics on stderr         */
+    int      threads;      /* 0 = auto (one per core), 1 = single threaded */
 } hydra_opts;
+
+/* Number of usable cores, as hydra would pick with threads = 0. */
+int hydra_cpu_count(void);
 
 /* Fill *o with the defaults for `level`. */
 void hydra_opts_init(hydra_opts *o, int level);

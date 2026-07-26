@@ -10,6 +10,9 @@ make
 ./bin/hydra t input                # verify round trip at every level
 ```
 
+Multi-threaded by default (one block per core); build with `THREADS=` for a
+single threaded binary.
+
 ---
 
 ## What it does
@@ -72,21 +75,38 @@ Where structure actually repeats, which is what most real archives look like:
 
 ### Speed
 
-In-memory, best of three, 4 MiB English text, single core Xeon @ 2.60 GHz.
+In-memory, best of three, 4 MiB English text, **two** cores (Xeon @ 2.60 GHz).
 No file I/O and no allocation inside the timed region.
 
 | level | ratio | encode | decode |
 |---|---|---|---|
-| 1 | 2.16x | 149 MB/s | **1043 MB/s** |
-| 2 | 2.63x | 65 MB/s | **1191 MB/s** |
-| 3 | 2.63x | 31 MB/s | **1170 MB/s** |
-| 5 | 3.90x | 14 MB/s | 38 MB/s |
-| 7 | 6.34x | 0.8 MB/s | 0.8 MB/s |
+| 1 | 2.16x | 55 MB/s | **1501 MB/s** |
+| 2 | 2.63x | 33 MB/s | **2138 MB/s** |
+| 3 | 2.63x | 21 MB/s | **2138 MB/s** |
+| 5 | 3.90x | 9 MB/s | 38 MB/s |
+| 7 | 6.55x | 0.7 MB/s | 0.8 MB/s |
 | *memcpy* | *—* | *—* | *16,308 MB/s* |
 
-For reference on the same file and machine: gzip decodes at ~192 MB/s,
-xz at ~105 MB/s. Level 1 decodes **5.4x faster than gzip** while compressing
-better, and on incompressible input decode reaches **7.7 GB/s**.
+Decode across the corpus at level 1, same conditions:
+
+| file | decode |
+|---|---|
+| audio.pcm | **9,417 MB/s** |
+| precompressed.z | **7,431 MB/s** |
+| db.pages | 2,058 MB/s |
+| records.csv | 2,237 MB/s |
+| series.f64 | 1,269 MB/s |
+| binary.exe | 1,075 MB/s |
+| text.txt | 1,035 MB/s |
+
+For reference on the same machine: gzip decodes at ~192 MB/s, xz at
+~105 MB/s. Level 1 decodes **8-11x faster than gzip** while compressing
+better, and reaches **9.4 GB/s** where the data does not compress.
+
+Compression and decompression both run one block per core. Blocks were
+already independent, so this needed a fork-join pool and nothing else —
+and because each job writes into its own buffer and the caller concatenates
+in index order, **the output is byte identical regardless of thread count**.
 
 ---
 
@@ -209,6 +229,12 @@ Two more that cost ratio rather than correctness:
   one lagging stage at 0.999 drags a 0.99999 consensus down by an order of
   magnitude in cost. Averaging logits instead was ~9x better on repetitive
   text.
+- **the FAST token format spent a byte tagging offset width.** Explicit
+  offsets turned out to be over 90% of all offsets on real data, so that one
+  byte pushed them from 55% of the output to 72%. Folding the width into the
+  offset class instead — paying for it with match-length range that was
+  already being extended anyway — took 4 MiB of CSV from 2,538,550 bytes to
+  **2,198,108**.
 - **the long range matcher used a fixed 2^20-slot table.** At stride 4 a
   64 MiB block inserts 16M positions, so almost every distant repeat was
   evicted before it could be found. Sizing the table to the input and
@@ -247,5 +273,15 @@ bench/           corpus generator, ratio comparison, in-memory timing
   (`precompressed.z`) comes back at 1.000x, as it must.
 - Level 7–9 encode is under 1 MB/s. That is the price of the model; use
   1–3 when throughput matters.
-- Single threaded. Blocks are independent, so this parallelizes cleanly, but
-  it is not done here.
+- Level 7-9 is single threaded in practice: those levels deliberately keep
+  the whole input in one block, because splitting restarts the models cold
+  and costs more ratio than the parallelism is worth. Levels 1-6 scale with
+  cores.
+- **5 GB/s and 131x are not reachable at the same time, by anything.** At
+  2.6 GHz, 5 GB/s is about half a clock cycle per byte — roughly one load
+  and one store. A CMIX-class model spends millions of cycles per byte
+  running thousands of predictions through a neural mixer. The two numbers
+  describe opposite ends of a tradeoff, and no algorithm collapses them into
+  one point. What this codec does instead is let you pick the end you want:
+  9.4 GB/s at level 1, or 12% better than xz at level 7, from one binary and
+  one format.

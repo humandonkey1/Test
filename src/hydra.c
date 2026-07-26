@@ -11,10 +11,24 @@
  * ========================================================================= */
 #include "hydra.h"
 #include "hz_int.h"
+#include "hz_pool.h"
 #include <stdio.h>
 
 /* ---- version / errors --------------------------------------------------- */
-const char *hydra_version_string(void) { return "hydra 1.0.0"; }
+const char *hydra_version_string(void) { return "hydra 1.1.0"; }
+
+#if defined(HZ_THREADS)
+#include <unistd.h>
+int hz_cpu_count(void)
+{
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n < 1) n = 1;
+    if (n > HZ_MAX_THREADS) n = HZ_MAX_THREADS;
+    return (int)n;
+}
+#endif
+
+int hydra_cpu_count(void) { return hz_cpu_count(); }
 
 const char *hydra_strerror(int code)
 {
@@ -71,6 +85,7 @@ void hydra_opts_init(hydra_opts *o, int level)
     o->enable_lrm   = 1;
     o->force_method = -1;
     o->verbose      = 0;
+    o->threads      = 0;
 }
 
 /* Choose the block size.
@@ -88,9 +103,14 @@ static int auto_block_log(int level, size_t src_size)
 {
     int bl, maxbl;
 
-    if (level <= 3)      maxbl = 24;   /* 16 MiB  */
-    else if (level <= 6) maxbl = 26;   /* 64 MiB  */
-    else                 maxbl = 28;   /* 256 MiB */
+    /* The FAST engine has no cross-block model to lose: its matches rarely
+     * reach past a megabyte anyway, so splitting costs almost no ratio and
+     * buys parallelism on both sides.  The context models are the opposite
+     * -- every split restarts them cold -- so those keep the whole input in
+     * one block whenever it fits. */
+    if (level <= 3)      maxbl = 20;   /* 1 MiB, favour parallelism */
+    else if (level <= 6) maxbl = 26;   /* 64 MiB                    */
+    else                 maxbl = 28;   /* 256 MiB                   */
     if (maxbl > HZ_BLOCK_LOG_MAX) maxbl = HZ_BLOCK_LOG_MAX;
 
     bl = HZ_BLOCK_LOG_MIN;
@@ -152,49 +172,51 @@ static void bhdr_write(uint8_t *p, const hz_bhdr *h)
 /* =========================================================================
  * Compression
  * ========================================================================= */
-int64_t hydra_compress(void *dstv, size_t dst_cap,
-                       const void *srcv, size_t src_size,
-                       const hydra_opts *opts_in)
+/* ---- per-block compression job -----------------------------------------
+ * Everything a block needs is either read-only (the source, the options) or
+ * private to the worker (three scratch buffers and an output buffer), so
+ * jobs never touch each other's state and the pool needs no locking beyond
+ * claiming the next index.
+ *
+ * Each job writes a complete block -- header and payload -- into its own
+ * buffer.  The caller concatenates them in index order, which is what keeps
+ * the output byte identical to a single threaded run. */
+typedef struct {
+    uint8_t *buf;        /* output for this block            */
+    size_t   cap;
+    size_t   len;
+    uint8_t *work;       /* staging for the filtered data    */
+    uint8_t *tmp;
+    uint8_t *shufbuf;
+    int      err;
+} hz_jobbuf;
+
+typedef struct {
+    const uint8_t    *src;
+    size_t            src_size;
+    size_t            bsize;
+    size_t            work_cap;
+    const hydra_opts *opts;
+    hz_jobbuf        *jobs;
+    int               njobs;
+} hz_cjob_ctx;
+
+static void hz_compress_block(void *vctx, int index)
 {
-    const uint8_t *src = (const uint8_t *)srcv;
-    uint8_t *dst = (uint8_t *)dstv;
-    hydra_opts opts;
-    size_t pos = 0, out = 0, bsize;
-    uint8_t *work = NULL, *tmp = NULL, *shufbuf = NULL;
-    size_t work_cap = 0;
-    int64_t rc = HYDRA_E_INTERNAL;
+    hz_cjob_ctx *c   = (hz_cjob_ctx *)vctx;
+    hz_jobbuf   *jb  = &c->jobs[index];
+    const hydra_opts *opts = c->opts;
+    size_t pos       = (size_t)index * c->bsize;
+    size_t n         = hz_minz(c->bsize, c->src_size - pos);
+    const uint8_t *blk = c->src + pos;
+    size_t work_cap  = c->work_cap;
+    uint8_t *work    = jb->work;
+    uint8_t *tmp     = jb->tmp;
+    uint8_t *shufbuf = jb->shufbuf;
 
-    if (!dst || (!src && src_size)) return HYDRA_E_PARAM;
+    jb->len = 0;
+    jb->err = HYDRA_OK;
 
-    if (opts_in) opts = *opts_in; else hydra_opts_init(&opts, HYDRA_LEVEL_DEFAULT);
-    if (opts.level < HYDRA_LEVEL_MIN || opts.level > HYDRA_LEVEL_MAX)
-        return HYDRA_E_PARAM;
-    if (opts.block_log == 0) opts.block_log = auto_block_log(opts.level, src_size);
-    if (opts.block_log < HZ_BLOCK_LOG_MIN || opts.block_log > HZ_BLOCK_LOG_MAX)
-        return HYDRA_E_PARAM;
-
-    hz_tables_init();
-    bsize = (size_t)1 << opts.block_log;
-
-    /* frame header */
-    if (dst_cap < 6) return HYDRA_E_DSTSIZE;
-    dst[0] = HZ_MAGIC0; dst[1] = HZ_MAGIC1; dst[2] = HZ_MAGIC2; dst[3] = HZ_MAGIC3;
-    dst[4] = HZ_FORMAT_VERSION;
-    dst[5] = (uint8_t)(HZ_FLAG_CSIZE | (opts.checksum ? HZ_FLAG_DIGEST : 0));
-    out = 6;
-    if (out + 8 > dst_cap) return HYDRA_E_DSTSIZE;
-    hz_put64le(dst + out, (uint64_t)src_size);
-    out += 8;
-
-    work_cap = bsize + bsize / 4 + 65536;
-    work    = (uint8_t *)malloc(work_cap);
-    tmp     = (uint8_t *)malloc(work_cap);
-    shufbuf = (uint8_t *)malloc(work_cap);
-    if (!work || !tmp || !shufbuf) { rc = HYDRA_E_NOMEM; goto done; }
-
-    while (pos < src_size) {
-        size_t n = hz_minz(bsize, src_size - pos);
-        const uint8_t *blk = src + pos;
         hz_bhdr h;
         hz_analysis an;
         int block_method;
@@ -208,10 +230,10 @@ int64_t hydra_compress(void *dstv, size_t dst_cap,
         /* Which engine will code this block?  The filter probe needs to know,
          * because the answer changes the decision. */
         {
-            int mth = opts.force_method;
+            int mth = opts->force_method;
             if (mth < 0) {
-                if (opts.level <= 3)      mth = HZ_M_FAST;
-                else if (opts.level <= 6) mth = HZ_M_MID;
+                if (opts->level <= 3)      mth = HZ_M_FAST;
+                else if (opts->level <= 6) mth = HZ_M_MID;
                 else                      mth = HZ_M_CM;
             }
             block_method = mth;
@@ -221,7 +243,7 @@ int64_t hydra_compress(void *dstv, size_t dst_cap,
         hz_analyze(blk, n, &an);
 
         /* Filtering needs a private copy; the input is const. */
-        if (n > work_cap) { rc = HYDRA_E_INTERNAL; goto done; }
+        if (n > work_cap) { jb->err = HYDRA_E_INTERNAL; return; }
         memcpy(work, blk, n);
         stage = work;
 
@@ -238,7 +260,7 @@ int64_t hydra_compress(void *dstv, size_t dst_cap,
          * The probe compresses a slice of the raw block and the same slice
          * of the de-duplicated block, and the comparison is per input byte
          * because the two slices cover different amounts of original data. */
-        if (opts.enable_lrm && an.lrm_worth && h.nfilters + 1 < HZ_MAX_FILTERS) {
+        if (opts->enable_lrm && an.lrm_worth && h.nfilters + 1 < HZ_MAX_FILTERS) {
             size_t l = hz_lrm_fwd(tmp, work_cap, stage, stage_len);
             int keep = 0;
 
@@ -251,10 +273,10 @@ int64_t hydra_compress(void *dstv, size_t dst_cap,
                     /* cost per byte of *original* data in each form */
                     size_t c_raw = hz_probe_cost(shufbuf, work_cap,
                                                  stage, probe_raw,
-                                                 block_method, opts.level);
+                                                 block_method, opts->level);
                     size_t c_lrm = hz_probe_cost(shufbuf, work_cap,
                                                  tmp, probe_lrm,
-                                                 block_method, opts.level);
+                                                 block_method, opts->level);
                     if (c_raw && c_lrm) {
                         /* scale the de-duplicated cost back to the same span
                          * of source bytes: probe_lrm bytes of filtered data
@@ -278,7 +300,7 @@ int64_t hydra_compress(void *dstv, size_t dst_cap,
             }
         }
 
-        if (opts.enable_exe && an.is_x86 && h.nfilters + 1 < HZ_MAX_FILTERS) {
+        if (opts->enable_exe && an.is_x86 && h.nfilters + 1 < HZ_MAX_FILTERS) {
             hz_exe_fwd(stage, stage_len);
             h.fid[h.nfilters] = HZ_F_EXE;
             h.fparam[h.nfilters] = 0;
@@ -287,7 +309,7 @@ int64_t hydra_compress(void *dstv, size_t dst_cap,
         /* Byte transpose, decided the same way: by measurement.  It runs
          * before delta so that any delta afterwards operates within a
          * column, which is what makes the pair effective on numeric arrays. */
-        if (opts.enable_delta && an.best_shuffle_width &&
+        if (opts->enable_delta && an.best_shuffle_width &&
             h.nfilters + 1 < HZ_MAX_FILTERS) {
             int w = an.best_shuffle_width;
             size_t probe = hz_minz(stage_len, (size_t)1 << 19);
@@ -300,13 +322,13 @@ int64_t hydra_compress(void *dstv, size_t dst_cap,
                 if (half > probe + 8192) {
                     size_t plain_c = hz_probe_cost(pb_lo(tmp, half), half,
                                                    stage + off, probe,
-                                                   block_method, opts.level);
+                                                   block_method, opts->level);
                     memcpy(tmp + half, stage + off, probe);
                     hz_shuf_fwd(tmp + half, shufbuf, probe, w);
                     {
                         size_t shuf_c = hz_probe_cost(pb_lo(tmp, half), half,
                                                       tmp + half, probe,
-                                                      block_method, opts.level);
+                                                      block_method, opts->level);
                         if (plain_c && shuf_c)
                             use_shuf = (shuf_c + shuf_c / 64) < plain_c;
                     }
@@ -330,7 +352,7 @@ int64_t hydra_compress(void *dstv, size_t dst_cap,
          * winner.  The slice is small enough that the extra work is a few
          * percent of the block, and it converts a heuristic that is wrong
          * on real data into a decision that is right by construction. */
-        if (opts.enable_delta && an.best_delta_stride &&
+        if (opts->enable_delta && an.best_delta_stride &&
             h.nfilters + 1 < HZ_MAX_FILTERS) {
             int use_delta = 1;
             /* Probe a slice from the middle of the block: the start is
@@ -347,11 +369,11 @@ int64_t hydra_compress(void *dstv, size_t dst_cap,
 
                 if (half > probe + 8192) {
                     plain_c = hz_probe_cost(pb, half, stage + off, probe,
-                                            block_method, opts.level);
+                                            block_method, opts->level);
                     memcpy(pb + half, stage + off, probe);
                     hz_delta_fwd(pb + half, probe, an.best_delta_stride);
                     delta_c = hz_probe_cost(pb, half, pb + half, probe,
-                                            block_method, opts.level);
+                                            block_method, opts->level);
                     /* Require a clear win: the filter costs a pass over the
                      * data and adds a header, so a coin-flip margin is not
                      * worth taking. */
@@ -376,18 +398,18 @@ int64_t hydra_compress(void *dstv, size_t dst_cap,
             int method = block_method;
             h.method = (uint8_t)method;
             hsz = bhdr_size(&h);
-            if (out + hsz + 8 > dst_cap) { rc = HYDRA_E_DSTSIZE; goto done; }
+            if (hsz + 8 > jb->cap) { jb->err = HYDRA_E_DSTSIZE; return; }
 
             if (method == HZ_M_CM) {
-                csz = hz_cm_compress(dst + out + hsz, dst_cap - out - hsz,
-                                     stage, stage_len, opts.level);
+                csz = hz_cm_compress(jb->buf + hsz, jb->cap - hsz,
+                                     stage, stage_len, opts->level);
                 used_cm = 1;
             } else if (method == HZ_M_MID) {
-                csz = hz_mid_compress(dst + out + hsz, dst_cap - out - hsz,
-                                      stage, stage_len, opts.level);
+                csz = hz_mid_compress(jb->buf + hsz, jb->cap - hsz,
+                                      stage, stage_len, opts->level);
             } else if (method == HZ_M_FAST) {
-                csz = hz_fast_compress(dst + out + hsz, dst_cap - out - hsz,
-                                       stage, stage_len, opts.level);
+                csz = hz_fast_compress(jb->buf + hsz, jb->cap - hsz,
+                                       stage, stage_len, opts->level);
             }
 
             /* Fall back to storing the *original* bytes whenever the coded
@@ -398,8 +420,8 @@ int64_t hydra_compress(void *dstv, size_t dst_cap,
                 h.method = HZ_M_RAW;
                 h.nfilters = 0;
                 hsz = bhdr_size(&h);
-                if (out + hsz + n > dst_cap) { rc = HYDRA_E_DSTSIZE; goto done; }
-                memcpy(dst + out + hsz, blk, n);
+                if (hsz + n > jb->cap) { jb->err = HYDRA_E_DSTSIZE; return; }
+                memcpy(jb->buf + hsz, blk, n);
                 csz = n;
                 stage_len = n;
                 used_cm = 0;
@@ -410,10 +432,10 @@ int64_t hydra_compress(void *dstv, size_t dst_cap,
         /* usize records what the entropy stage produced, i.e. the length the
          * filters have to be undone from. */
         h.usize = (uint32_t)stage_len;
-        bhdr_write(dst + out, &h);
-        out += hsz + csz;
+        bhdr_write(jb->buf, &h);
+        jb->len = hsz + csz;
 
-        if (opts.verbose) {
+        if (opts->verbose) {
             fprintf(stderr,
                 "[hydra] block %8zu -> %8zu  m=%s filters=%d delta=%d x86=%d lrm=%d H0=%.2f\n",
                 n, csz,
@@ -425,7 +447,85 @@ int64_t hydra_compress(void *dstv, size_t dst_cap,
 
         /* The frame stores the original block length separately from the
          * filtered length, so record it now that the header is written. */
-        pos += n;
+}
+
+int64_t hydra_compress(void *dstv, size_t dst_cap,
+                       const void *srcv, size_t src_size,
+                       const hydra_opts *opts_in)
+{
+    const uint8_t *src = (const uint8_t *)srcv;
+    uint8_t *dst = (uint8_t *)dstv;
+    hydra_opts opts;
+    size_t out = 0, bsize, work_cap;
+    hz_cjob_ctx ctx;
+    hz_jobbuf *jobs = NULL;
+    int njobs = 0, nthreads, i, allocated = 0;
+    int64_t rc = HYDRA_E_INTERNAL;
+
+    if (!dst || (!src && src_size)) return HYDRA_E_PARAM;
+
+    if (opts_in) opts = *opts_in; else hydra_opts_init(&opts, HYDRA_LEVEL_DEFAULT);
+    if (opts.level < HYDRA_LEVEL_MIN || opts.level > HYDRA_LEVEL_MAX)
+        return HYDRA_E_PARAM;
+    if (opts.block_log == 0) opts.block_log = auto_block_log(opts.level, src_size);
+    if (opts.block_log < HZ_BLOCK_LOG_MIN || opts.block_log > HZ_BLOCK_LOG_MAX)
+        return HYDRA_E_PARAM;
+    if (opts.threads < 0) return HYDRA_E_PARAM;
+
+    hz_tables_init();
+    bsize = (size_t)1 << opts.block_log;
+
+    /* frame header */
+    if (dst_cap < 14) return HYDRA_E_DSTSIZE;
+    dst[0] = HZ_MAGIC0; dst[1] = HZ_MAGIC1; dst[2] = HZ_MAGIC2; dst[3] = HZ_MAGIC3;
+    dst[4] = HZ_FORMAT_VERSION;
+    dst[5] = (uint8_t)(HZ_FLAG_CSIZE | (opts.checksum ? HZ_FLAG_DIGEST : 0));
+    hz_put64le(dst + 6, (uint64_t)src_size);
+    out = 14;
+
+    njobs = (int)((src_size + bsize - 1) / bsize);
+    if (njobs == 0) njobs = 0;
+
+    nthreads = opts.threads ? opts.threads : hz_cpu_count();
+    if (nthreads < 1) nthreads = 1;
+    if (nthreads > njobs) nthreads = njobs;
+    if (nthreads > HZ_MAX_THREADS) nthreads = HZ_MAX_THREADS;
+
+    work_cap = bsize + bsize / 4 + 65536;
+
+    if (njobs > 0) {
+        jobs = (hz_jobbuf *)calloc((size_t)njobs, sizeof(hz_jobbuf));
+        if (!jobs) return HYDRA_E_NOMEM;
+
+        /* Every concurrent worker needs its own scratch, and every block
+         * needs somewhere to put its result.  Allocating per job rather
+         * than per thread keeps the job function free of any notion of
+         * which worker is running it. */
+        for (i = 0; i < njobs; ++i) {
+            size_t n = hz_minz(bsize, src_size - (size_t)i * bsize);
+            jobs[i].cap     = n + n / 4 + 65536;
+            jobs[i].buf     = (uint8_t *)malloc(jobs[i].cap);
+            jobs[i].work    = (uint8_t *)malloc(work_cap);
+            jobs[i].tmp     = (uint8_t *)malloc(work_cap);
+            jobs[i].shufbuf = (uint8_t *)malloc(work_cap);
+            if (!jobs[i].buf || !jobs[i].work || !jobs[i].tmp || !jobs[i].shufbuf) {
+                rc = HYDRA_E_NOMEM; goto done;
+            }
+            ++allocated;
+        }
+
+        ctx.src = src; ctx.src_size = src_size; ctx.bsize = bsize;
+        ctx.work_cap = work_cap; ctx.opts = &opts;
+        ctx.jobs = jobs; ctx.njobs = njobs;
+
+        hz_pool_run(hz_compress_block, &ctx, njobs, nthreads);
+
+        for (i = 0; i < njobs; ++i) {
+            if (jobs[i].err != HYDRA_OK) { rc = jobs[i].err; goto done; }
+            if (jobs[i].len > dst_cap - out) { rc = HYDRA_E_DSTSIZE; goto done; }
+            memcpy(dst + out, jobs[i].buf, jobs[i].len);
+            out += jobs[i].len;
+        }
     }
 
     if (out + 1 > dst_cap) { rc = HYDRA_E_DSTSIZE; goto done; }
@@ -440,7 +540,14 @@ int64_t hydra_compress(void *dstv, size_t dst_cap,
     rc = (int64_t)out;
 
 done:
-    free(work); free(tmp); free(shufbuf);
+    if (jobs) {
+        for (i = 0; i < njobs; ++i) {
+            free(jobs[i].buf); free(jobs[i].work);
+            free(jobs[i].tmp); free(jobs[i].shufbuf);
+        }
+        free(jobs);
+    }
+    (void)allocated;
     return rc;
 }
 
@@ -458,6 +565,102 @@ int64_t hydra_frame_content_size(const void *srcv, size_t src_size)
     return (int64_t)hz_get64le(src + 6);
 }
 
+/* ---- per-block decompression job ---------------------------------------
+ * The scan pass below walks the block headers and records where each block
+ * starts and how long its output is.  Once that index exists the blocks are
+ * fully independent again, so decoding them is another fork-join.
+ *
+ * Scanning is cheap -- it reads two integers per block and skips the
+ * payload -- and it has to happen anyway to validate the frame. */
+typedef struct {
+    const uint8_t *payload;
+    size_t         csize;
+    size_t         usize;      /* size the entropy stage produces */
+    size_t         outpos;     /* where this block lands in dst   */
+    uint8_t        method;
+    uint8_t        nfilters;
+    uint8_t        fid[HZ_MAX_FILTERS];
+    uint8_t        fparam[HZ_MAX_FILTERS];
+    int            err;
+} hz_dblk;
+
+typedef struct {
+    hz_dblk *blk;
+    uint8_t *dst;
+    size_t   dst_cap;
+} hz_djob_ctx;
+
+static void hz_decompress_block(void *vctx, int index)
+{
+    hz_djob_ctx *c = (hz_djob_ctx *)vctx;
+    hz_dblk *b = &c->blk[index];
+    uint8_t *tmp = NULL;
+    size_t len;
+    int i;
+
+    b->err = HYDRA_OK;
+
+    /* A block whose only filter is the long range one can decode straight
+     * into the output; anything else needs a staging buffer because the
+     * filters run in place on the entropy stage's result. */
+    tmp = (uint8_t *)malloc(b->usize + 64);
+    if (!tmp) { b->err = HYDRA_E_NOMEM; return; }
+
+    if (b->method == HZ_M_RAW) {
+        if (b->csize != b->usize) { b->err = HYDRA_E_CORRUPT; goto out; }
+        memcpy(tmp, b->payload, b->csize);
+    } else if (b->method == HZ_M_FAST) {
+        if (hz_fast_decompress(tmp, b->usize, b->payload, b->csize) != 0) {
+            b->err = HYDRA_E_CORRUPT; goto out;
+        }
+    } else if (b->method == HZ_M_MID) {
+        if (hz_mid_decompress(tmp, b->usize, b->payload, b->csize) != 0) {
+            b->err = HYDRA_E_CORRUPT; goto out;
+        }
+    } else {
+        if (hz_cm_decompress(tmp, b->usize, b->payload, b->csize) != 0) {
+            b->err = HYDRA_E_CORRUPT; goto out;
+        }
+    }
+
+    len = b->usize;
+    for (i = (int)b->nfilters - 1; i >= 0; --i) {
+        switch (b->fid[i]) {
+            case HZ_F_DELTA:
+                hz_delta_rev(tmp, len, b->fparam[i]);
+                break;
+            case HZ_F_EXE:
+                hz_exe_rev(tmp, len);
+                break;
+            case HZ_F_SHUF: {
+                uint8_t *sb = (uint8_t *)malloc(len ? len : 1);
+                if (!sb) { b->err = HYDRA_E_NOMEM; goto out; }
+                hz_shuf_rev(tmp, sb, len, b->fparam[i]);
+                free(sb);
+                break;
+            }
+            case HZ_F_LRM: {
+                size_t outn = 0;
+                if (i != 0) { b->err = HYDRA_E_CORRUPT; goto out; }
+                if (hz_lrm_rev(c->dst + b->outpos, c->dst_cap - b->outpos,
+                               &outn, tmp, len) != 0) {
+                    b->err = HYDRA_E_CORRUPT; goto out;
+                }
+                free(tmp);
+                return;
+            }
+            default:
+                b->err = HYDRA_E_CORRUPT; goto out;
+        }
+    }
+
+    if (len > c->dst_cap - b->outpos) { b->err = HYDRA_E_CORRUPT; goto out; }
+    memcpy(c->dst + b->outpos, tmp, len);
+
+out:
+    free(tmp);
+}
+
 int64_t hydra_decompress(void *dstv, size_t dst_cap,
                          const void *srcv, size_t src_size)
 {
@@ -465,9 +668,9 @@ int64_t hydra_decompress(void *dstv, size_t dst_cap,
     uint8_t *dst = (uint8_t *)dstv;
     size_t ip = 0, op = 0;
     uint64_t declared;
-    int flags;
-    uint8_t *tmp = NULL;
-    size_t tmp_cap = 0;
+    int flags, i, nblk = 0, cap_blk = 0, nthreads;
+    hz_dblk *blk = NULL;
+    hz_djob_ctx ctx;
     int64_t rc = HYDRA_E_INTERNAL;
 
     if (!src || src_size < 15) return HYDRA_E_SRCSIZE;
@@ -482,116 +685,79 @@ int64_t hydra_decompress(void *dstv, size_t dst_cap,
     if (declared > dst_cap) return HYDRA_E_DSTSIZE;
     hz_tables_init();
 
+    /* ---- pass 1: index the blocks and validate every header ---- */
     for (;;) {
-        hz_bhdr h;
-        int i;
-        size_t need;
+        hz_dblk b;
+        memset(&b, 0, sizeof(b));
 
         if (ip >= src_size) { rc = HYDRA_E_CORRUPT; goto done; }
         if (src[ip] == HZ_BLK_END) { ++ip; break; }
 
         if (ip + 2 > src_size) { rc = HYDRA_E_CORRUPT; goto done; }
-        h.method   = src[ip++];
-        h.nfilters = src[ip++];
-        /* nfilters indexes fid[HZ_MAX_FILTERS], so the bound is strict:
-         * accepting == HZ_MAX_FILTERS writes one past the end on a
-         * corrupted header. */
-        if (h.method > HZ_M_CM || h.nfilters >= HZ_MAX_FILTERS) {
+        b.method   = src[ip++];
+        b.nfilters = src[ip++];
+        if (b.method > HZ_M_CM || b.nfilters >= HZ_MAX_FILTERS) {
             rc = HYDRA_E_CORRUPT; goto done;
         }
-        if (ip + 2u * h.nfilters + 8u > src_size) { rc = HYDRA_E_CORRUPT; goto done; }
-        for (i = 0; i < h.nfilters; ++i) {
-            h.fid[i]    = src[ip++];
-            h.fparam[i] = src[ip++];
+        if (ip + 2u * b.nfilters + 8u > src_size) { rc = HYDRA_E_CORRUPT; goto done; }
+        for (i = 0; i < (int)b.nfilters; ++i) {
+            b.fid[i]    = src[ip++];
+            b.fparam[i] = src[ip++];
         }
-        h.usize = hz_get32le(src + ip); ip += 4;
-        h.csize = hz_get32le(src + ip); ip += 4;
+        b.usize = hz_get32le(src + ip); ip += 4;
+        b.csize = hz_get32le(src + ip); ip += 4;
 
-        if ((size_t)h.csize > src_size - ip) { rc = HYDRA_E_CORRUPT; goto done; }
+        if (b.csize > src_size - ip) { rc = HYDRA_E_CORRUPT; goto done; }
+        b.payload = src + ip;
+        ip += b.csize;
 
-        /* Space for the filtered form, which may be shorter than the final
-         * block when the long range filter is in play. */
-        need = (size_t)h.usize + 65536;
-        if (need > tmp_cap) {
-            uint8_t *nt = (uint8_t *)realloc(tmp, need);
-            if (!nt) { rc = HYDRA_E_NOMEM; goto done; }
-            tmp = nt; tmp_cap = need;
-        }
-
-        /* ---- entropy stage ---- */
-        if (h.method == HZ_M_RAW) {
-            if (h.csize != h.usize) { rc = HYDRA_E_CORRUPT; goto done; }
-            memcpy(tmp, src + ip, h.csize);
-        } else if (h.method == HZ_M_FAST) {
-            if (hz_fast_decompress(tmp, h.usize, src + ip, h.csize) != 0) {
-                rc = HYDRA_E_CORRUPT; goto done;
-            }
-        } else if (h.method == HZ_M_MID) {
-            if (hz_mid_decompress(tmp, h.usize, src + ip, h.csize) != 0) {
-                rc = HYDRA_E_CORRUPT; goto done;
-            }
+        /* Where this block's output starts.  For an LRM block the final
+         * length is only known after decoding, so such a block must be the
+         * last one -- the encoder never produces LRM on any other block
+         * because LRM only ever runs when the whole input is one block. */
+        b.outpos = op;
+        if (b.nfilters > 0 && b.fid[0] == HZ_F_LRM) {
+            op = (size_t)declared;      /* claims the remainder */
         } else {
-            if (hz_cm_decompress(tmp, h.usize, src + ip, h.csize) != 0) {
-                rc = HYDRA_E_CORRUPT; goto done;
-            }
+            if (b.usize > dst_cap - op) { rc = HYDRA_E_CORRUPT; goto done; }
+            op += b.usize;
         }
-        ip += h.csize;
 
-        /* ---- undo filters in reverse order ---- */
-        {
-            size_t len = h.usize;
-            for (i = (int)h.nfilters - 1; i >= 0; --i) {
-                switch (h.fid[i]) {
-                    case HZ_F_DELTA:
-                        hz_delta_rev(tmp, len, h.fparam[i]);
-                        break;
-                    case HZ_F_EXE:
-                        hz_exe_rev(tmp, len);
-                        break;
-                    case HZ_F_SHUF: {
-                        uint8_t *sb = (uint8_t *)malloc(len ? len : 1);
-                        if (!sb) { rc = HYDRA_E_NOMEM; goto done; }
-                        hz_shuf_rev(tmp, sb, len, h.fparam[i]);
-                        free(sb);
-                        break;
-                    }
-                    case HZ_F_LRM: {
-                        size_t outn = 0;
-                        if (op > dst_cap) { rc = HYDRA_E_CORRUPT; goto done; }
-                        if (hz_lrm_rev(dst + op, dst_cap - op, &outn, tmp, len) != 0) {
-                            rc = HYDRA_E_CORRUPT; goto done;
-                        }
-                        /* LRM writes straight into the output; anything left
-                         * to undo would have to work in place there. */
-                        len = outn;
-                        if (i != 0) { rc = HYDRA_E_CORRUPT; goto done; }
-                        op += len;
-                        goto block_done;
-                    }
-                    default:
-                        rc = HYDRA_E_CORRUPT; goto done;
-                }
-            }
-            if (len > dst_cap - op) { rc = HYDRA_E_CORRUPT; goto done; }
-            memcpy(dst + op, tmp, len);
-            op += len;
+        if (nblk == cap_blk) {
+            int ncap = cap_blk ? cap_blk * 2 : 16;
+            hz_dblk *nb = (hz_dblk *)realloc(blk, (size_t)ncap * sizeof(hz_dblk));
+            if (!nb) { rc = HYDRA_E_NOMEM; goto done; }
+            blk = nb; cap_blk = ncap;
         }
-    block_done: ;
+        blk[nblk++] = b;
     }
 
     if (op != (size_t)declared) { rc = HYDRA_E_CORRUPT; goto done; }
 
+    /* ---- pass 2: decode the blocks, in parallel when there is more
+     * than one ---- */
+    if (nblk > 0) {
+        nthreads = hz_cpu_count();
+        if (nthreads > nblk) nthreads = nblk;
+
+        ctx.blk = blk; ctx.dst = dst; ctx.dst_cap = dst_cap;
+        hz_pool_run(hz_decompress_block, &ctx, nblk, nthreads);
+
+        for (i = 0; i < nblk; ++i)
+            if (blk[i].err != HYDRA_OK) { rc = blk[i].err; goto done; }
+    }
+
     if (flags & HZ_FLAG_DIGEST) {
         if (ip + 8 > src_size) { rc = HYDRA_E_CORRUPT; goto done; }
-        if (hz_get64le(src + ip) != hydra_digest(dst, op)) {
+        if (hz_get64le(src + ip) != hydra_digest(dst, (size_t)declared)) {
             rc = HYDRA_E_CHECKSUM; goto done;
         }
         ip += 8;
     }
 
-    rc = (int64_t)op;
+    rc = (int64_t)declared;
 
 done:
-    free(tmp);
+    free(blk);
     return rc;
 }

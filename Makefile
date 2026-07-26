@@ -5,8 +5,9 @@ CC      ?= cc
 CSTD    ?= -std=c99
 WARN    ?= -Wall -Wextra -Wshadow -Wpointer-arith -Wcast-align -Wstrict-prototypes
 OPT     ?= -O3 -fomit-frame-pointer -funroll-loops
-CFLAGS  ?= $(CSTD) $(WARN) $(OPT)
-LDFLAGS ?=
+THREADS ?= -DHZ_THREADS -pthread
+CFLAGS  ?= $(CSTD) $(WARN) $(OPT) $(THREADS)
+LDFLAGS ?= -pthread
 
 SRCDIR  := src
 OBJDIR  := build
@@ -44,7 +45,7 @@ test: $(BINDIR)/hydra_test
 	./$(BINDIR)/hydra_test
 
 # sanitized build: catches the memory and integer bugs a compressor is prone to
-asan: CFLAGS := $(CSTD) $(WARN) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
+asan: CFLAGS := $(CSTD) $(WARN) $(THREADS) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
 asan: clean $(BINDIR)/hydra_test
 	ASAN_OPTIONS=detect_leaks=1 ./$(BINDIR)/hydra_test
 

@@ -228,6 +228,8 @@ HZ_INLINE size_t hz_maxz(size_t a, size_t b) { return a > b ? a : b; }
 #define HZ_F_SHUF  4
 #define HZ_MAX_FILTERS 6
 
+#define HZ_MAX_THREADS 64
+
 #define HZ_BLOCK_LOG_MIN 16
 #define HZ_BLOCK_LOG_MAX 30
 
