@@ -219,6 +219,7 @@ HZ_INLINE size_t hz_maxz(size_t a, size_t b) { return a > b ? a : b; }
 #define HZ_M_FAST 1
 #define HZ_M_MID  2
 #define HZ_M_CM   3
+#define HZ_M_SGI  4
 #define HZ_BLK_END 0xFF
 
 #define HZ_F_NONE  0

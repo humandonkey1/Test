@@ -57,6 +57,7 @@ typedef struct {
     int      force_method; /* -1 auto, 0 raw, 1 fast, 2 cm                 */
     int      verbose;      /* emit per-block diagnostics on stderr         */
     int      threads;      /* 0 = auto (one per core), 1 = single threaded */
+    int      enable_sgi;   /* allow structural grammar induction           */
 } hydra_opts;
 
 /* Number of usable cores, as hydra would pick with threads = 0. */

@@ -17,15 +17,55 @@ single threaded binary.
 
 ## What it does
 
-One codec, three engines, chosen by level. Every stage is written here from
-first principles: the range coder, the probability model, the mixer, the LZ
-parser, the filters.
+One codec, four engines. Every stage is written here from first principles:
+the range coder, the probability model, the mixer, the LZ parser, the
+filters, and the grammar inducer.
 
 | Level | Engine | Use |
 |-------|--------|-----|
 | 1–3 | **FAST** — byte aligned LZ | GB/s decode |
 | 4–6 | **STRONG** — LZ coded through the range coder | balanced |
 | 7–9 | **MAX** — context mixing | best ratio |
+| any | **SGI** — structural grammar induction | machine generated data |
+
+SGI is not a variant of the other three. LZ asks *"have I seen these bytes
+before?"*; context mixing asks *"what byte comes next?"*. Both treat the
+input as an undifferentiated stream. Neither ever asks **what produced it**.
+
+An enormous share of real data — logs, telemetry, database exports, sensor
+frames — is the output of a short program run many times. A 16 MB telemetry
+table is a four-line loop. The other engines faithfully compress the
+*output* of that loop. SGI recovers the loop and compresses **that**:
+
+1. **Record induction** — find the period at which *structure* repeats, via
+   delimiter regularity or a positional periodicity scan.
+2. **Field segmentation** — split records where the character class changes
+   consistently across rows. Finds columns in CSV, JSON, fixed-width binary
+   and log lines without knowing any of those formats.
+3. **Law inference** — per column, search a small space of generating laws:
+   `CONST`, `CYCLE`, `COUNTER`, `FLOAT_LIN`, `ENUM`. A column with a law
+   **costs nothing per record** — its whole contribution is written once.
+4. **Residual routing** — lawless columns are gathered column-wise and only
+   those reach the entropy stage.
+
+The decoder re-runs the laws. On a fully lawful block it never touches a
+probability model or a bit coder — it walks a table and writes bytes, so
+throughput is bounded by memory bandwidth rather than by anything
+algorithmic.
+
+**This is the one place where ratio and speed rise together**, because the
+output size stops depending on the input size at all:
+
+| file | size | gzip -9 | xz -9e | **hydra -5** | hydra enc | hydra dec |
+|---|---|---|---|---|---|---|
+| telemetry.csv | 16.4 MB | 146x | 5,138x | **21,299x** | 1,018 MB/s | **13,245 MB/s** |
+| metrics.csv | 11.4 MB | 9x | 69x | **4,412x** | 46 MB/s | 907 MB/s |
+| frames.bin | 2.4 MB | 3x | 39x | **4,240x** | 36 MB/s | 525 MB/s |
+
+On prose, photographs or already-compressed data there is no law to find.
+SGI detects this during induction, declines, and the block falls through to
+the engines that do work there. The generic corpus total is unchanged at
+2.599x — a specialist that knows when to step aside.
 
 ---
 

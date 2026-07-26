@@ -14,7 +14,7 @@ OBJDIR  := build
 BINDIR  := bin
 
 LIBSRC  := $(SRCDIR)/hydra.c $(SRCDIR)/hz_tables.c $(SRCDIR)/hz_model.c \
-           $(SRCDIR)/hz_fast.c $(SRCDIR)/hz_mid.c $(SRCDIR)/hz_cm.c $(SRCDIR)/hz_filter.c
+           $(SRCDIR)/hz_fast.c $(SRCDIR)/hz_mid.c $(SRCDIR)/hz_cm.c $(SRCDIR)/hz_sgi.c $(SRCDIR)/hz_filter.c
 LIBOBJ  := $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(LIBSRC))
 
 BIN     := $(BINDIR)/hydra

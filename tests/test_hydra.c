@@ -203,6 +203,79 @@ static void gen_struct_array(uint8_t *b, size_t n)
     while (i < n) b[i++] = 0;
 }
 
+/* machine generated telemetry: the case SGI exists for */
+static void gen_telemetry(uint8_t *b, size_t n)
+{
+    size_t p = 0;
+    unsigned i = 0;
+    while (p + 64 < n) {
+        char line[96];
+        int l = snprintf(line, sizeof(line),
+                         "sensor_%03u,2026-07-26T12:00:%02u,%u.%03u,OK\n",
+                         i % 50, i % 60, 20 + (i % 7), (i % 100) * 10);
+        if (p + (size_t)l > n) break;
+        memcpy(b + p, line, (size_t)l);
+        p += (size_t)l;
+        ++i;
+    }
+    while (p < n) b[p++] = '\n';
+}
+
+/* structured rows where only some columns follow a law -- exercises the
+ * mixed lawful/residual path rather than the all-lawful fast one */
+static void gen_semi_lawful(uint8_t *b, size_t n)
+{
+    size_t p = 0;
+    unsigned i = 0;
+    while (p + 80 < n) {
+        char line[128];
+        int l = snprintf(line, sizeof(line),
+                         "%08u,%s,%u,%08x,CONSTANT\n",
+                         i, (i & 1) ? "alpha" : "beta",
+                         i % 13, (unsigned)rnd());
+        if (p + (size_t)l > n) break;
+        memcpy(b + p, line, (size_t)l);
+        p += (size_t)l;
+        ++i;
+    }
+    while (p < n) b[p++] = '\n';
+}
+
+/* Rows that look structured but are not: same shape, no law anywhere.
+ * SGI must decline rather than produce a bloated header. */
+static void gen_pseudo_structured(uint8_t *b, size_t n)
+{
+    size_t p = 0;
+    while (p + 80 < n) {
+        char line[128];
+        int l = snprintf(line, sizeof(line), "%u,%u,%u,%u,%u\n",
+                         (unsigned)rnd(), (unsigned)rnd(), (unsigned)rnd(),
+                         (unsigned)rnd(), (unsigned)rnd());
+        if (p + (size_t)l > n) break;
+        memcpy(b + p, line, (size_t)l);
+        p += (size_t)l;
+    }
+    while (p < n) b[p++] = '\n';
+}
+
+/* Ragged rows: field counts vary, so the split must be rejected. */
+static void gen_ragged(uint8_t *b, size_t n)
+{
+    size_t p = 0;
+    while (p + 40 < n) {
+        char line[128];
+        int k = 1 + (int)rnd_below(6), j, l = 0;
+        for (j = 0; j < k && l < 100; ++j)
+            l += snprintf(line + l, sizeof(line) - (size_t)l, "%s%u",
+                          j ? "," : "", (unsigned)rnd_below(1000));
+        l += snprintf(line + l, sizeof(line) - (size_t)l, "\n");
+        if (p + (size_t)l > n) break;
+        memcpy(b + p, line, (size_t)l);
+        p += (size_t)l;
+    }
+    while (p < n) b[p++] = '\n';
+}
+
 /* long range duplication: a payload that repeats far apart */
 static void gen_lrm(uint8_t *b, size_t n)
 {
@@ -244,6 +317,10 @@ static void test_generators(void)
         { "lrm",     gen_lrm     },
         { "f64",     gen_f64     },
         { "structs", gen_struct_array },
+        { "telemetry", gen_telemetry },
+        { "semilaw", gen_semi_lawful },
+        { "pseudostruct", gen_pseudo_structured },
+        { "ragged",  gen_ragged  },
         { "mixed",   gen_mixed   }
     };
     size_t sizes[] = { 1024, 64 * 1024, 700 * 1024 };

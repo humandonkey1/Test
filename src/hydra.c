@@ -12,6 +12,7 @@
 #include "hydra.h"
 #include "hz_int.h"
 #include "hz_pool.h"
+#include "hz_sgi.h"
 #include <stdio.h>
 
 /* ---- version / errors --------------------------------------------------- */
@@ -86,6 +87,7 @@ void hydra_opts_init(hydra_opts *o, int level)
     o->force_method = -1;
     o->verbose      = 0;
     o->threads      = 0;
+    o->enable_sgi   = 1;
 }
 
 /* Choose the block size.
@@ -237,6 +239,62 @@ static void hz_compress_block(void *vctx, int index)
                 else                      mth = HZ_M_CM;
             }
             block_method = mth;
+        }
+
+        /* Structural grammar induction gets first refusal, on the raw
+         * block and before any filter runs.
+         *
+         * Order matters here and it cost a debugging round to see why: the
+         * long range de-duplicator rewrites repeated rows into distance
+         * references, which is precisely the structure the grammar needs to
+         * observe.  Running SGI afterwards showed it a stream with the
+         * regularity already stripped out, and it declined on data it
+         * models near-perfectly.
+         *
+         * When the input is machine generated this does not merely beat the
+         * other engines, it changes what the output size depends on: a law
+         * costs the same whether the generating loop ran a thousand times
+         * or a billion.  When there is no structure it declines cheaply. */
+        if (opts->enable_sgi && n >= 4096) {
+            size_t sgz = hz_sgi_compress(jb->buf + 10, jb->cap - 26,
+                                         blk, n, opts->level);
+            if (sgz) {
+                /* Compare like with like.
+                 *
+                 * A grammar is mostly fixed cost, so its bytes per input
+                 * byte keep falling as the block grows, while a probe of a
+                 * rival engine measures a rate that does not.  Comparing
+                 * the two directly flatters whichever saw more data.
+                 *
+                 * So estimate what the rival would spend on the *whole*
+                 * block by scaling its probe rate, and require the grammar
+                 * to beat that outright.  Ties go to the rival: the generic
+                 * engines degrade gracefully on data that only half fits
+                 * their assumptions, and a grammar does not. */
+                size_t probe = hz_minz(n, (size_t)1 << 18);
+                size_t rival = hz_probe_cost(jb->work, work_cap,
+                                             blk, probe, block_method,
+                                             opts->level);
+                if (rival) {
+                    double rival_full =
+                        (double)rival * (double)n / (double)probe;
+                    if ((double)sgz >= rival_full * 0.9) sgz = 0;
+                }
+            }
+            if (sgz) {
+                hz_bhdr sh;
+                memset(&sh, 0, sizeof(sh));
+                sh.method   = HZ_M_SGI;
+                sh.nfilters = 0;
+                sh.usize    = (uint32_t)n;
+                sh.csize    = (uint32_t)sgz;
+                bhdr_write(jb->buf, &sh);
+                jb->len = 10 + sgz;
+                if (opts->verbose)
+                    fprintf(stderr, "[hydra] block %8lu -> %8lu  m=sgi\n",
+                            (unsigned long)n, (unsigned long)sgz);
+                return;
+            }
         }
 
         /* ---- pick filters ---- */
@@ -617,6 +675,10 @@ static void hz_decompress_block(void *vctx, int index)
         if (hz_mid_decompress(tmp, b->usize, b->payload, b->csize) != 0) {
             b->err = HYDRA_E_CORRUPT; goto out;
         }
+    } else if (b->method == HZ_M_SGI) {
+        if (hz_sgi_decompress(tmp, b->usize, b->payload, b->csize) != 0) {
+            b->err = HYDRA_E_CORRUPT; goto out;
+        }
     } else {
         if (hz_cm_decompress(tmp, b->usize, b->payload, b->csize) != 0) {
             b->err = HYDRA_E_CORRUPT; goto out;
@@ -696,7 +758,7 @@ int64_t hydra_decompress(void *dstv, size_t dst_cap,
         if (ip + 2 > src_size) { rc = HYDRA_E_CORRUPT; goto done; }
         b.method   = src[ip++];
         b.nfilters = src[ip++];
-        if (b.method > HZ_M_CM || b.nfilters >= HZ_MAX_FILTERS) {
+        if (b.method > HZ_M_SGI || b.nfilters >= HZ_MAX_FILTERS) {
             rc = HYDRA_E_CORRUPT; goto done;
         }
         if (ip + 2u * b.nfilters + 8u > src_size) { rc = HYDRA_E_CORRUPT; goto done; }
