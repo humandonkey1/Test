@@ -113,6 +113,41 @@ Where structure actually repeats, which is what most real archives look like:
 | access.log | 15.1 MB | 7.2x | 9.7x | **11.3x** |
 | vm.img | 13.1 MB | 1.0x | **6.0x** | 5.9x |
 
+### Wikipedia (enwik-format)
+
+**This is not enwik8.** The official enwik8/enwik9 are prefixes of a Wikipedia
+XML dump, and this sandbox has no network egress — curl, wget and urllib all
+fail at the TLS handshake, so the archive cannot be fetched and its
+leaderboard figures cannot be reproduced here. What `bench/make_enwik.py`
+builds instead is a corpus in the *same format* — the same XML page skeleton,
+real MediaWiki markup, real reference clutter, real Unicode — assembled from
+article text pulled from `en.wikipedia.org/wiki/Special:Export` during the
+session (Data compression, World War II, United States, Physics, Mathematics
+and Computer science).
+
+Two measurements, because they say different things:
+
+**52 KB, single pass, no duplication.** This is the honest one — every byte
+is distinct source text:
+
+| | gzip -9 | bzip2 -9 | xz -9e | **hydra -7** |
+|---|---|---|---|---|
+| bytes | 20,065 | 18,676 | 18,900 | **18,610** |
+| ratio | 2.619x | 2.814x | 2.781x | **2.824x** |
+
+**8 MB, articles cycled to reach size.** The cycling introduces long-range
+duplication the real enwik8 does not have, so every ratio here is inflated —
+it measures window reach more than modelling:
+
+| | gzip -9 | bzip2 -9 | xz -9e | hydra -7 |
+|---|---|---|---|---|
+| ratio | 2.7x | 23.0x | **224.1x** | 204.4x |
+
+xz wins that one; its 64 MB window spans the whole cycle. Reported as
+measured.
+
+This test earned its place by finding a real bug — see Correctness below.
+
 ### Speed
 
 In-memory, best of three, 4 MiB English text, **two** cores (Xeon @ 2.60 GHz).
@@ -235,6 +270,15 @@ through the public API and compares byte for byte:
   all rejected or benign, none silently producing wrong output
 
 Bugs this suite caught, all of which round-tripped fine on casual input:
+
+- **multi-block frames placed blocks at the wrong offset.** The block header
+  stored only the length the entropy stage produces, and the decoder used it
+  to position the block in the output. For the long range filter, which
+  *shrinks* its input, those two lengths differ — so every block after the
+  first landed wrong. It hid because a single-block frame is the common case
+  and there they coincide. Found by the Wikipedia test at exactly 2^20 + 1
+  bytes, one byte past the FAST block size. The header now carries both
+  lengths, and `test_multiblock_filters` pins the boundary sizes.
 
 - **the x86 filter was not a bijection.** The set of words with top byte
   `0x00`/`0xFF` has 2²⁵ members, but sign-extending to 24 bits produces only

@@ -155,11 +155,12 @@ typedef struct {
     uint8_t nfilters;
     uint8_t fid[HZ_MAX_FILTERS];
     uint8_t fparam[HZ_MAX_FILTERS];
-    uint32_t usize;
-    uint32_t csize;
+    uint32_t usize;   /* length the entropy stage produces (pre-unfilter) */
+    uint32_t osize;   /* bytes this block contributes to the final output */
+    uint32_t csize;   /* payload length                                   */
 } hz_bhdr;
 
-static size_t bhdr_size(const hz_bhdr *h) { return 2 + 2 * (size_t)h->nfilters + 8; }
+static size_t bhdr_size(const hz_bhdr *h) { return 2 + 2 * (size_t)h->nfilters + 12; }
 
 static void bhdr_write(uint8_t *p, const hz_bhdr *h)
 {
@@ -168,6 +169,7 @@ static void bhdr_write(uint8_t *p, const hz_bhdr *h)
     *p++ = h->nfilters;
     for (i = 0; i < h->nfilters; ++i) { *p++ = h->fid[i]; *p++ = h->fparam[i]; }
     hz_put32le(p, h->usize); p += 4;
+    hz_put32le(p, h->osize); p += 4;
     hz_put32le(p, h->csize);
 }
 
@@ -256,7 +258,7 @@ static void hz_compress_block(void *vctx, int index)
          * costs the same whether the generating loop ran a thousand times
          * or a billion.  When there is no structure it declines cheaply. */
         if (opts->enable_sgi && n >= 4096) {
-            size_t sgz = hz_sgi_compress(jb->buf + 10, jb->cap - 26,
+            size_t sgz = hz_sgi_compress(jb->buf + 14, jb->cap - 32,
                                          blk, n, opts->level);
             if (sgz) {
                 /* Compare like with like.
@@ -287,9 +289,10 @@ static void hz_compress_block(void *vctx, int index)
                 sh.method   = HZ_M_SGI;
                 sh.nfilters = 0;
                 sh.usize    = (uint32_t)n;
+                sh.osize    = (uint32_t)n;
                 sh.csize    = (uint32_t)sgz;
                 bhdr_write(jb->buf, &sh);
-                jb->len = 10 + sgz;
+                jb->len = bhdr_size(&sh) + sgz;
                 if (opts->verbose)
                     fprintf(stderr, "[hydra] block %8lu -> %8lu  m=sgi\n",
                             (unsigned long)n, (unsigned long)sgz);
@@ -487,9 +490,18 @@ static void hz_compress_block(void *vctx, int index)
         }
 
         h.csize = (uint32_t)csz;
-        /* usize records what the entropy stage produced, i.e. the length the
-         * filters have to be undone from. */
+        /* usize is what the entropy stage produces -- the length the filters
+         * are undone from.  osize is what the block contributes to the final
+         * output, which differs whenever a filter changes the length.
+         *
+         * These were conflated before, and the LRM filter is exactly the
+         * case where they differ: it shrinks the data, so the decoder sized
+         * the block by the filtered length and every later block landed at
+         * the wrong offset.  The old code papered over it by assuming an
+         * LRM block is always the last one -- true for a single-block frame,
+         * false the moment the input needs two. */
         h.usize = (uint32_t)stage_len;
+        h.osize = (uint32_t)n;
         bhdr_write(jb->buf, &h);
         jb->len = hsz + csz;
 
@@ -634,7 +646,8 @@ typedef struct {
     const uint8_t *payload;
     size_t         csize;
     size_t         usize;      /* size the entropy stage produces */
-    size_t         outpos;     /* where this block lands in dst   */
+    size_t         osize;      /* bytes contributed to the output  */
+    size_t         outpos;     /* where this block lands in dst    */
     uint8_t        method;
     uint8_t        nfilters;
     uint8_t        fid[HZ_MAX_FILTERS];
@@ -704,10 +717,11 @@ static void hz_decompress_block(void *vctx, int index)
             case HZ_F_LRM: {
                 size_t outn = 0;
                 if (i != 0) { b->err = HYDRA_E_CORRUPT; goto out; }
-                if (hz_lrm_rev(c->dst + b->outpos, c->dst_cap - b->outpos,
+                if (hz_lrm_rev(c->dst + b->outpos, b->osize,
                                &outn, tmp, len) != 0) {
                     b->err = HYDRA_E_CORRUPT; goto out;
                 }
+                if (outn != b->osize) { b->err = HYDRA_E_CORRUPT; goto out; }
                 free(tmp);
                 return;
             }
@@ -716,6 +730,7 @@ static void hz_decompress_block(void *vctx, int index)
         }
     }
 
+    if (len != b->osize) { b->err = HYDRA_E_CORRUPT; goto out; }
     if (len > c->dst_cap - b->outpos) { b->err = HYDRA_E_CORRUPT; goto out; }
     memcpy(c->dst + b->outpos, tmp, len);
 
@@ -761,12 +776,13 @@ int64_t hydra_decompress(void *dstv, size_t dst_cap,
         if (b.method > HZ_M_SGI || b.nfilters >= HZ_MAX_FILTERS) {
             rc = HYDRA_E_CORRUPT; goto done;
         }
-        if (ip + 2u * b.nfilters + 8u > src_size) { rc = HYDRA_E_CORRUPT; goto done; }
+        if (ip + 2u * b.nfilters + 12u > src_size) { rc = HYDRA_E_CORRUPT; goto done; }
         for (i = 0; i < (int)b.nfilters; ++i) {
             b.fid[i]    = src[ip++];
             b.fparam[i] = src[ip++];
         }
         b.usize = hz_get32le(src + ip); ip += 4;
+        b.osize = hz_get32le(src + ip); ip += 4;
         b.csize = hz_get32le(src + ip); ip += 4;
 
         if (b.csize > src_size - ip) { rc = HYDRA_E_CORRUPT; goto done; }
@@ -777,13 +793,11 @@ int64_t hydra_decompress(void *dstv, size_t dst_cap,
          * length is only known after decoding, so such a block must be the
          * last one -- the encoder never produces LRM on any other block
          * because LRM only ever runs when the whole input is one block. */
+        /* Placement uses osize, the block's true contribution.  Deriving it
+         * from usize is wrong for any length-changing filter. */
         b.outpos = op;
-        if (b.nfilters > 0 && b.fid[0] == HZ_F_LRM) {
-            op = (size_t)declared;      /* claims the remainder */
-        } else {
-            if (b.usize > dst_cap - op) { rc = HYDRA_E_CORRUPT; goto done; }
-            op += b.usize;
-        }
+        if (b.osize > dst_cap - op) { rc = HYDRA_E_CORRUPT; goto done; }
+        op += b.osize;
 
         if (nblk == cap_blk) {
             int ncap = cap_blk ? cap_blk * 2 : 16;

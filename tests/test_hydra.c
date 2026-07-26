@@ -384,6 +384,52 @@ static void test_sizes(void)
     free(buf);
 }
 
+/* Multi-block frames where a length-changing filter fires.
+ *
+ * Regression for a real bug: the block header stored only the *filtered*
+ * length, and the decoder used it to place the block in the output.  For
+ * the long range filter, which shrinks its input, every block after the
+ * first then landed at the wrong offset.  It stayed hidden because a
+ * single-block frame is the common case and there the two lengths coincide.
+ * Caught on Wikipedia-format XML at exactly 2^20 + 1 bytes -- one byte past
+ * the FAST block size. */
+static void test_multiblock_filters(void)
+{
+    /* sizes that straddle the 1 MiB FAST block boundary */
+    size_t sizes[] = { (1u << 20) - 1, (1u << 20), (1u << 20) + 1,
+                       (1u << 20) + 4096, 3u << 20 };
+    size_t k;
+    uint8_t *buf = (uint8_t *)malloc(4u << 20);
+
+    printf("-- multi-block frames with length-changing filters\n");
+    if (!buf) { fail("alloc"); return; }
+
+    for (k = 0; k < sizeof(sizes) / sizeof(sizes[0]); ++k) {
+        size_t n = sizes[k], p = 0;
+        int l;
+        /* Highly duplicated structured text: guarantees the long range
+         * filter engages, which is the condition that exposed the bug. */
+        rseed(4242 + k);
+        while (p < n) {
+            static const char *unit =
+                "  <page>\n    <title>Example</title>\n    <id>12345</id>\n"
+                "    <revision><timestamp>2026-07-26T12:00:00Z</timestamp>\n"
+                "    <text xml:space=\"preserve\">Lorem ipsum dolor sit amet, "
+                "consectetur adipiscing elit, sed do eiusmod tempor.</text>\n"
+                "    </revision>\n  </page>\n";
+            size_t ul = strlen(unit);
+            if (p + ul > n) break;
+            memcpy(buf + p, unit, ul);
+            p += ul;
+        }
+        while (p < n) buf[p++] = '\n';
+
+        for (l = 1; l <= 9; l += 2)
+            check_roundtrip(buf, n, l, "multiblock lrm");
+    }
+    free(buf);
+}
+
 static void test_adversarial(void)
 {
     uint8_t *buf = (uint8_t *)malloc(300000);
@@ -590,6 +636,7 @@ int main(void)
     test_api_edges();
     test_sizes();
     test_generators();
+    test_multiblock_filters();
     test_adversarial();
     test_random_fuzz();
     test_corruption();
