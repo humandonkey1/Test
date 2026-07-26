@@ -262,6 +262,55 @@ The default stays on inspection: it wins on nothing here but costs less on
 the common case where no filter applies. `--blind` is the better choice when
 you do not know what you are compressing, which is most of the time.
 
+### Reordering the file to suit the models: tested, and it does not work
+
+An appealing idea, taken seriously enough to build a tool for it
+(`tools/reorder_study.c`): a mixed archive holds text, then an image, then
+more text, and a sequential model appears to re-learn at every seam. So let
+the compressor permute similar regions together, store the permutation, and
+give each model one long homogeneous run.
+
+Measured three ways on a deliberately hostile input — 32 chunks strictly
+interleaving text, source, CSV and PCM audio, the worst case for a
+sequential model:
+
+| ordering | output | |
+|---|---|---|
+| sequential (as stored) | **572,462** | — |
+| clustered by byte histogram | 582,501 | +1.75% |
+| clustered by *measured* pairwise cost | 582,776 | +1.80% |
+| perfectly grouped by known type (oracle) | 582,220 | +1.70% |
+
+Every reordering loses, including the oracle that no real scheme could beat.
+The marginal cost per chunk says why:
+
+```
+chunk   bytes added
+1             10389     type A, first time
+2              4914     type B, first time
+3             12425     type C, first time
+4             54925     type D, first time
+5              8736     type A again  -- cheaper than chunk 1
+6              4089     type B again  -- cheaper than chunk 2
+7             11255     type C again  -- cheaper than chunk 3
+```
+
+**The models were never re-learning.** A chunk of a type seen before costs
+less the second time, even with three other types in between. Hashed
+contexts from different data land in different table slots and coexist
+happily — that is the whole point of context mixing. So there is no seam
+damage to repair, and permuting only destroys the long matches that ran
+inside each original region.
+
+Splitting records into separate streams (lengths in one, payloads in
+another) fails for the same reason: logs.json +1.94%, records.csv +3.01%.
+The models use adjacent bytes as context, and breaking adjacency costs more
+than homogeneity pays.
+
+Where the idea *does* work is below the record, not above it: the byte
+transpose in the filter stage regroups a record's columns and earns its
+place on numeric arrays. Same principle, right granularity.
+
 ### Filters are chosen by measurement, not heuristics
 
 This turned out to matter more than any single modelling change. Every
