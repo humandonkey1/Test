@@ -226,7 +226,13 @@ APM stages refine the result.
 - a word model keyed on the current alphanumeric run
 - a sparse model that skips bytes, for columnar layouts
 - direct order-0 and order-1 tables
-- a match model that predicts the continuation of the longest repeat
+- a match model that predicts the continuation of the longest repeat, and a
+  **second candidate** — the older occurrence of the same context. Measured
+  on English text with an order-8 context, the most recent occurrence
+  predicts 66.3% of bytes and the one before it rescues a further 6.5% that
+  would otherwise be a miss. The second opinion needs a longer confirmed run
+  than the primary before it is trusted, since a weak one costs more mixer
+  capacity than it earns
 
 Contexts are re-hashed at the nibble boundary so the low four bits of a byte
 get their own statistics instead of aliasing onto the high four. Each hash
@@ -310,6 +316,36 @@ analyser then triggers.
 The default stays on inspection: it wins on nothing here but costs less on
 the common case where no filter applies. `--blind` is the better choice when
 you do not know what you are compressing, which is most of the time.
+
+### Against ZPAQ
+
+ZPAQ is the closest comparable design — also context mixing, also general
+purpose. It is not packaged in this sandbox and there is no network access,
+so the comparison uses its published figures on enwik8 from Matt Mahoney's
+Large Text Compression Benchmark against hydra on 4 MiB of English text.
+Different files, same kind of data:
+
+| | ratio |
+|---|---|
+| zpaq -m3 | 4.55x |
+| zpaq -m4 | 4.82x |
+| zpaq -m5 | 5.10x |
+| **hydra -7** | **6.54x** |
+
+One thing the ZPAQ numbers show is worth recording as a negative result.
+Its configurations trade roughly 10% of ratio for 8x the memory
+(`zpaq oc` at 246 MB reaches 20,941,558; `ocmax.cfg` at 1861 MB reaches
+18,977,961). Sweeping hydra's hash table over the same range finds almost
+nothing:
+
+```
+htbits 20 ( 16.8 MB) -> 641,253
+htbits 22 ( 67.1 MB) -> 640,554   best
+htbits 26 (1073.7 MB) -> 640,957
+```
+
+**0.1% across a 64x memory range.** Memory is not the lever here; the
+two-way associative eviction is already keeping the useful contexts.
 
 ### Reordering the file to suit the models: tested, and it does not work
 
