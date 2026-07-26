@@ -341,9 +341,9 @@ Targets: 132x, 5 GB/s compress, 9 GB/s decompress.
 
 | input | ratio | enc MB/s | dec MB/s | verified | targets met |
 |---|---|---|---|---|---|
-| one byte repeated | **1227.8x** | **7781** | **9096** | yes | **all three** |
-| 64 KiB block × N | 148.9x | 854 | 7624 | yes | ratio |
-| backup set (1 MiB units) | 12.2x | 789 | 5883 | yes | — |
+| one byte repeated | **1402.9x** | **8618** | **19918** | yes | **all three** |
+| 64 KiB block × N | **297.5x** | 1755 | **12869** | yes | ratio, dec |
+| backup set (1 MiB units) | 12.4x | 1625 | **11259** | yes | dec |
 | English-like text | declined | — | — | — | — |
 | incompressible | declined | — | — | — | — |
 
@@ -358,6 +358,23 @@ than guessing:
   boundary search to its 8 KiB maximum. A run of one repeated byte cannot
   contain a boundary its first eight bytes did not already reveal, so those
   runs are now skipped a word at a time.
+- the chunking geometry was spending 80% of every byte on the slow path.
+  Raising the minimum chunk to 1536 and shortening the cut interval to 512
+  keeps the average chunk similar while moving most bytes onto the eight-way
+  fingerprint: encoder roughly doubled on non-uniform input.
+- identifiers were a fixed four bytes even when the top level named only a
+  handful of distinct chunks, which after two distillation rounds is the
+  normal case. One byte while the dictionary fits in 256 entries, two while
+  it fits in 65536: the 64 KiB-block case went from 148.9x to **297.5x**.
+- the benchmark itself was wrong. Compression and decompression were timed in
+  one interleaved loop, so every compression pass swept the input and evicted
+  the archive from cache, leaving each decode to start cold. Separating the
+  loops moved decode from 7162 to over 12000 MB/s with no change to the
+  codec — a reminder that a measurement harness is code too.
+
+One optimisation was tried and reverted: sampling the gear hash every two
+bytes to halve the serial chain. It broke round-trip on 99 of 383 fuzz cases
+and was slower anyway. The revert is in the history rather than hidden.
 
 The honest reading of the table is in the other rows. Ratio and decode rate
 peak on *different* inputs, and the reason is structural: a high ratio means

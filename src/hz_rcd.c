@@ -68,9 +68,22 @@
  * duplication but cost more identifiers; large chunks are cheaper to name
  * but miss short repeats.  These are the values the sweep in the experiment
  * settled on. */
-#define RCD_MIN_CHUNK   256
-#define RCD_AVG_BITS    10          /* ~1 KiB average */
-#define RCD_MAX_CHUNK   8192
+/* Chunking geometry.
+ *
+ * These two numbers set where the encoder spends its time, and the split is
+ * lopsided: the guaranteed-no-cut prefix runs through an eight-way
+ * fingerprint at ~5.5 GB/s, while the boundary search is serial and manages
+ * ~1.5 GB/s.  With a 256 byte minimum and a 1 KiB average interval, 80% of
+ * every byte read went down the slow path.
+ *
+ * Raising the minimum and shortening the cut interval keeps the average
+ * chunk size similar while moving most bytes onto the fast path.  The cost
+ * is coarser deduplication -- a repeat shorter than the minimum cannot be
+ * found -- which is the right trade for an engine whose job is large-scale
+ * duplication, and the entropy stage behind it catches the short stuff. */
+#define RCD_MIN_CHUNK   1536
+#define RCD_AVG_BITS    9           /* ~512 byte cut interval */
+#define RCD_MAX_CHUNK   16384
 #define RCD_MAX_LEVELS  8
 #define RCD_ID_BYTES    4
 
@@ -356,11 +369,25 @@ size_t hz_rcd_compress(uint8_t *dst, size_t dst_cap,
         }
     }
 
-    if ((size_t)(omax - o) < 16 + nids * RCD_ID_BYTES) goto fail;
-    rcd_put_v(&o, nids);
+    /* Identifier width.
+     *
+     * A fixed four bytes is pure waste when the top level names only a
+     * handful of distinct chunks -- and after a couple of distillation
+     * rounds that is the normal case.  One byte per identifier while the
+     * dictionary fits in 256 entries, two while it fits in 65536. */
     {
+        uint32_t top_nd = ndicts[lev - 1];
+        int idw = top_nd <= 256 ? 1 : (top_nd <= 65536 ? 2 : 4);
         size_t j;
-        for (j = 0; j < nids; ++j) { hz_put32le(o, ids[j]); o += 4; }
+        if ((size_t)(omax - o) < 16 + nids * (size_t)idw) goto fail;
+        rcd_put_v(&o, nids);
+        *o++ = (uint8_t)idw;
+        for (j = 0; j < nids; ++j) {
+            uint32_t v = ids[j];
+            if (idw == 1)      { *o++ = (uint8_t)v; }
+            else if (idw == 2) { hz_wr16(o, (uint16_t)v); o += 2; }
+            else               { hz_put32le(o, v); o += 4; }
+        }
     }
 
     for (k = 0; k < lev; ++k) free(dicts[k]);
@@ -421,14 +448,25 @@ int hz_rcd_decompress(uint8_t *dst, size_t n, const uint8_t *src, size_t src_siz
 
     {
         uint64_t t = rcd_get_v(&p, e, &err);
-        if (err || (size_t)(e - p) < t * RCD_ID_BYTES) goto done;
+        int idw;
+        size_t j;
+        if (err || p >= e) goto done;
+        idw = *p++;
+        if (idw != 1 && idw != 2 && idw != 4) goto done;
+        if ((size_t)(e - p) < t * (size_t)idw) goto done;
         ntop = (size_t)t;
-    }
 
-    /* start from the top identifier list and expand downward */
-    curbuf = (uint8_t *)malloc(ntop * RCD_ID_BYTES + 8);
-    if (!curbuf) goto done;
-    memcpy(curbuf, p, ntop * RCD_ID_BYTES);
+        /* widen to the internal fixed layout the expansion loop uses */
+        curbuf = (uint8_t *)malloc(ntop * RCD_ID_BYTES + 8);
+        if (!curbuf) goto done;
+        for (j = 0; j < ntop; ++j) {
+            uint32_t v;
+            if (idw == 1)      v = p[j];
+            else if (idw == 2) v = hz_rd16(p + j * 2);
+            else               v = hz_get32le(p + j * 4);
+            hz_put32le(curbuf + j * 4, v);
+        }
+    }
 
     {
         size_t curlen = ntop * RCD_ID_BYTES;
