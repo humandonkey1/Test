@@ -81,6 +81,9 @@
 #define SGI_LAW_FLOAT_LIN 3   /* fixed-point decimal, base + step * index    */
 #define SGI_LAW_ENUM      4   /* few distinct values, index coded per record */
 #define SGI_LAW_RESIDUAL  5   /* no law; column routed to the entropy stage  */
+#define SGI_LAW_BCONST    6   /* binary field, identical bytes every record  */
+#define SGI_LAW_BCOUNTER  7   /* binary LE integer, base + step * index      */
+#define SGI_LAW_BCYCLE    8   /* binary LE integer cycling with a period     */
 
 #define SGI_MAX_FIELDS    64
 #define SGI_MAX_ENUM      256

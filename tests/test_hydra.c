@@ -279,6 +279,69 @@ static void gen_ragged(uint8_t *b, size_t n)
     while (p < n) b[p++] = '\n';
 }
 
+/* Fixed-width binary frames: counter, cycling id, constant, float.
+ * This is the shape SGI's binary lane fitter exists for. */
+static void gen_binframes(uint8_t *b, size_t n)
+{
+    size_t p = 0;
+    uint32_t i = 0;
+    while (p + 12 <= n) {
+        uint32_t id = i;
+        uint16_t cyc = (uint16_t)(i % 1000);
+        uint16_t k = 42;
+        uint32_t fl = 0x3F800000u;          /* 1.0f */
+        memcpy(b + p, &id, 4);
+        memcpy(b + p + 4, &cyc, 2);
+        memcpy(b + p + 6, &k, 2);
+        memcpy(b + p + 8, &fl, 4);
+        p += 12;
+        ++i;
+    }
+    while (p < n) b[p++] = 0;
+}
+
+/* Binary frames where only some lanes are lawful: forces the mixed
+ * lawful/residual path through the binary serialiser. */
+static void gen_binmixed(uint8_t *b, size_t n)
+{
+    size_t p = 0;
+    uint32_t i = 0;
+    while (p + 16 <= n) {
+        uint32_t id = i;                    /* counter  */
+        uint32_t noise = rnd();             /* residual */
+        uint16_t cyc = (uint16_t)(i % 37);  /* cycle    */
+        uint16_t k = 0xBEEF;                /* constant */
+        uint32_t noise2 = rnd();            /* residual */
+        memcpy(b + p, &id, 4);
+        memcpy(b + p + 4, &noise, 4);
+        memcpy(b + p + 8, &cyc, 2);
+        memcpy(b + p + 10, &k, 2);
+        memcpy(b + p + 12, &noise2, 4);
+        p += 16;
+        ++i;
+    }
+    while (p < n) b[p++] = 0;
+}
+
+/* A wrapping counter: real hardware produces these constantly, and the
+ * fitter has to recognise one rather than give up at the wrap. */
+static void gen_binwrap(uint8_t *b, size_t n)
+{
+    size_t p = 0;
+    uint16_t i = 65500;                     /* wraps almost immediately */
+    while (p + 8 <= n) {
+        uint16_t a = i;
+        uint16_t c = (uint16_t)(i * 7);
+        uint32_t k = 0x12345678u;
+        memcpy(b + p, &a, 2);
+        memcpy(b + p + 2, &c, 2);
+        memcpy(b + p + 4, &k, 4);
+        p += 8;
+        ++i;
+    }
+    while (p < n) b[p++] = 0;
+}
+
 /* long range duplication: a payload that repeats far apart */
 static void gen_lrm(uint8_t *b, size_t n)
 {
@@ -321,6 +384,9 @@ static void test_generators(void)
         { "f64",     gen_f64     },
         { "structs", gen_struct_array },
         { "telemetry", gen_telemetry },
+        { "binframes", gen_binframes },
+        { "binmixed", gen_binmixed },
+        { "binwrap",  gen_binwrap  },
         { "semilaw", gen_semi_lawful },
         { "pseudostruct", gen_pseudo_structured },
         { "ragged",  gen_ragged  },

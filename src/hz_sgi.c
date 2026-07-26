@@ -25,20 +25,8 @@ typedef struct {
     size_t   width;       /* fixed width, when kind == 2              */
     size_t   nrec;
     size_t   first;       /* offset of the first record               */
+    size_t   reclen_best; /* record length chosen by the lane fitter  */
 } sgi_layout;
-
-/* How strongly does the input repeat with period p?
- * Fraction of positions where src[i] == src[i-p], sampled. */
-static uint32_t period_score(const uint8_t *src, size_t n, size_t p)
-{
-    size_t i, step, cnt = 0, hits = 0;
-    if (p == 0 || p >= n) return 0;
-    step = (n - p) / 8192;
-    if (step == 0) step = 1;
-    for (i = p; i < n && cnt < 8192; i += step, ++cnt)
-        if (src[i] == src[i - p]) ++hits;
-    return cnt ? (uint32_t)((hits * 1000) / cnt) : 0;
-}
 
 /* Locate a delimiter: a byte whose occurrences are numerous and evenly
  * spaced.  Evenness matters more than count -- a space is common in prose
@@ -100,15 +88,63 @@ static int find_delimiter(const uint8_t *src, size_t n, uint8_t *out_delim,
 /* Fixed width: try every plausible period and keep the strongest, favouring
  * the smallest period among near-equals so we find the true record rather
  * than a multiple of it. */
+/* Find the record width of a fixed layout.
+ *
+ * Raw positional agreement is the wrong test on its own.  A frame holding a
+ * counter, a cycling id and a constant agrees at only a third of its byte
+ * positions -- the counter changes every record by design -- so a threshold
+ * tuned for "most bytes repeat" rejects exactly the structured binary data
+ * this is meant to find.
+ *
+ * What identifies a record width is that the agreement is *concentrated*:
+ * some byte positions agree almost always and others almost never.  A wrong
+ * width smears agreement evenly across positions.  So the score below is the
+ * count of positions that individually agree at least 90% of the time, and
+ * the smallest width reaching a useful count wins. */
 static size_t find_fixed_width(const uint8_t *src, size_t n)
 {
     size_t p, best = 0;
-    uint32_t bests = 0;
-    for (p = 2; p <= 1024 && p * 8 < n; ++p) {
-        uint32_t s = period_score(src, n, p);
-        if (s > bests + 20) { bests = s; best = p; }
+    uint32_t bestcols = 0;
+
+    for (p = 2; p <= 1024 && p * 16 < n; ++p) {
+        size_t nrec = n / p, r, col;
+        uint32_t strong = 0;
+        size_t sample = nrec < 512 ? nrec : 512;
+        if (sample < 8) continue;
+
+        for (col = 0; col < p; ++col) {
+            size_t agree = 0;
+            for (r = 1; r < sample; ++r)
+                if (src[r * p + col] == src[(r - 1) * p + col]) ++agree;
+            if (agree * 10 >= (sample - 1) * 9) ++strong;
+        }
+        /* Take the *first* width that pins down a quarter of its columns.
+         *
+         * Every multiple of the true record width scores at least as well as
+         * the width itself -- 1020 bytes "works" for a 12 byte frame because
+         * it is 85 frames laid end to end.  Scanning upward and stopping at
+         * the first qualifier returns the fundamental period rather than a
+         * harmonic of it, which is what the lane fitter needs. */
+        if (strong * 4 >= p) { bestcols = strong; best = p; break; }
     }
-    return bests >= 600 ? best : 0;
+    (void)bestcols;
+    return best;
+}
+
+/* Is this plausibly text?  A delimiter search on binary data finds spurious
+ * newlines -- 0x0a occurs about once every 256 random bytes, which looks
+ * regular enough to fool the gap statistics.  Requiring that most bytes be
+ * printable costs one pass and removes the whole failure mode. */
+static int looks_textual(const uint8_t *src, size_t n)
+{
+    size_t i, step = n / 8192, printable = 0, seen = 0;
+    if (step == 0) step = 1;
+    for (i = 0; i < n; i += step, ++seen) {
+        uint8_t b = src[i];
+        if ((b >= 0x20 && b < 0x7F) || b == '\n' || b == '\r' || b == '\t')
+            ++printable;
+    }
+    return seen && printable * 10 >= seen * 9;
 }
 
 static void induce_layout(const uint8_t *src, size_t n, sgi_layout *L)
@@ -119,7 +155,7 @@ static void induce_layout(const uint8_t *src, size_t n, sgi_layout *L)
     memset(L, 0, sizeof(*L));
     if (n < 1024) return;
 
-    if (find_delimiter(src, n, &d, &avg)) {
+    if (looks_textual(src, n) && find_delimiter(src, n, &d, &avg)) {
         size_t i, cnt = 0;
         for (i = 0; i < n; ++i) if (src[i] == d) ++cnt;
         if (cnt >= 8) {
@@ -680,6 +716,151 @@ static void infer_field(const uint8_t *src, const sgi_split *S, int f,
     L->law = SGI_LAW_RESIDUAL;
 }
 
+
+/* ===========================================================================
+ * BINARY FIELD LAWS
+ *
+ * The text laws above parse digits.  An enormous amount of machine generated
+ * data is not text at all: sensor frames, network captures, database pages,
+ * serialised structs.  Those hold the same laws -- a counter, a constant, a
+ * cycling identifier -- encoded as little endian integers rather than ASCII.
+ *
+ * Reading them needs nothing new conceptually, only a different accessor.
+ * A fixed width record is split into aligned integer lanes of 1, 2, 4 and 8
+ * bytes, and each lane is tested for the same laws.  A lane that carries a
+ * law costs nothing per record, exactly as before.
+ * ========================================================================= */
+
+/* Read a little endian unsigned integer of `w` bytes. */
+HZ_INLINE uint64_t bin_get(const uint8_t *p, int w)
+{
+    uint64_t v = 0;
+    int i;
+    for (i = w - 1; i >= 0; --i) v = (v << 8) | p[i];
+    return v;
+}
+
+HZ_INLINE void bin_put(uint8_t *p, uint64_t v, int w)
+{
+    int i;
+    for (i = 0; i < w; ++i) { p[i] = (uint8_t)(v & 0xFF); v >>= 8; }
+}
+
+/* Fit a law to one aligned lane of a fixed width record.
+ *
+ * `off` is the byte offset of the lane inside the record and `w` its width.
+ * Returns the law, filling *base / *step / *period as appropriate.
+ *
+ * Steps are computed modulo 2^(8w) so that a wrapping counter -- which real
+ * hardware produces constantly -- is still recognised as a counter rather
+ * than dismissed at the wrap. */
+static int bin_fit(const uint8_t *src, size_t nrec, size_t reclen,
+                   size_t off, int w, uint64_t *base, uint64_t *step,
+                   uint32_t *period)
+{
+    uint64_t mask = (w >= 8) ? ~0ull : ((1ull << (8 * w)) - 1);
+    uint64_t v0, v1, d;
+    size_t r;
+
+    if (nrec < 3) return SGI_LAW_RESIDUAL;
+
+    v0 = bin_get(src + off, w);
+    v1 = bin_get(src + reclen + off, w);
+
+    /* constant */
+    {
+        int same = 1;
+        for (r = 1; r < nrec; ++r)
+            if (bin_get(src + r * reclen + off, w) != v0) { same = 0; break; }
+        if (same) { *base = v0; return SGI_LAW_BCONST; }
+    }
+
+    /* arithmetic progression, wrapping */
+    d = (v1 - v0) & mask;
+    {
+        int ok = 1;
+        uint64_t expect = v1;
+        for (r = 2; r < nrec; ++r) {
+            expect = (expect + d) & mask;
+            if (bin_get(src + r * reclen + off, w) != expect) { ok = 0; break; }
+        }
+        if (ok) { *base = v0; *step = d; return SGI_LAW_BCOUNTER; }
+    }
+
+    /* cycle: the lane repeats with some period */
+    {
+        size_t p, maxp = nrec / 3;
+        if (maxp > SGI_MAX_CYCLE) maxp = SGI_MAX_CYCLE;
+        for (p = 1; p <= maxp; ++p) {
+            int ok = 1;
+            for (r = p; r < nrec; ++r) {
+                if (bin_get(src + r * reclen + off, w) !=
+                    bin_get(src + (r - p) * reclen + off, w)) { ok = 0; break; }
+            }
+            if (ok) { *period = (uint32_t)p; return SGI_LAW_BCYCLE; }
+        }
+    }
+
+    return SGI_LAW_RESIDUAL;
+}
+
+/* A lane assignment for a fixed width record: which widths at which offsets. */
+typedef struct {
+    uint8_t  off;
+    uint8_t  w;
+    uint8_t  law;
+    uint64_t base;
+    uint64_t step;
+    uint32_t period;
+    uint32_t tab_off;    /* offset of this lane's cycle table in the blob */
+} sgi_lane;
+
+/* Choose a lane layout for a record of `reclen` bytes.
+ *
+ * Wide lanes are tried first at each position: a 4 byte counter read as four
+ * 1 byte lanes looks like noise in the upper bytes, so finding the widest
+ * lane that carries a law is what makes the difference.  Anything left over
+ * becomes 1 byte residual lanes. */
+static int bin_layout(const uint8_t *src, size_t nrec, size_t reclen,
+                      sgi_lane *lane, int maxlane)
+{
+    size_t off = 0;
+    int n = 0;
+
+    while (off < reclen && n < maxlane) {
+        int widths[4], nw = 0, wi, chosen = 0;
+        uint64_t base = 0, step = 0;
+        uint32_t period = 0;
+        int law = SGI_LAW_RESIDUAL;
+
+        if (reclen - off >= 8 && (off % 8) == 0) widths[nw++] = 8;
+        if (reclen - off >= 4 && (off % 4) == 0) widths[nw++] = 4;
+        if (reclen - off >= 2 && (off % 2) == 0) widths[nw++] = 2;
+        widths[nw++] = 1;
+
+        for (wi = 0; wi < nw; ++wi) {
+            uint64_t b = 0, s = 0;
+            uint32_t p = 0;
+            int l = bin_fit(src, nrec, reclen, off, widths[wi], &b, &s, &p);
+            if (l != SGI_LAW_RESIDUAL) {
+                chosen = widths[wi]; law = l; base = b; step = s; period = p;
+                break;
+            }
+        }
+        if (!chosen) chosen = 1;      /* residual, one byte at a time */
+
+        lane[n].off    = (uint8_t)off;
+        lane[n].w      = (uint8_t)chosen;
+        lane[n].law    = (uint8_t)law;
+        lane[n].base   = base;
+        lane[n].step   = step;
+        lane[n].period = period;
+        ++n;
+        off += (size_t)chosen;
+    }
+    return (off == reclen) ? n : 0;
+}
+
 /* ===========================================================================
  * 4. SERIALISATION
  *
@@ -725,6 +906,185 @@ HZ_INLINE int64_t sgi_get_s(const uint8_t **p, const uint8_t *e, int *err)
     return (int64_t)((u >> 1) ^ (~(u & 1) + 1));
 }
 
+
+/* ===========================================================================
+ * BINARY PATH: serialise and replay a lane layout
+ *
+ * Header:  magic, kind=3, reclen, nrec, nlane, total, then per lane
+ *          (off, w, law, and the law's parameters).
+ * Payload: cycle tables, then residual lanes column-wise, then the tail.
+ * ========================================================================= */
+#define SGI_KIND_BIN 3
+
+static size_t sgi_bin_compress(uint8_t *dst, size_t dst_cap,
+                               const uint8_t *src, size_t n, size_t reclen)
+{
+    sgi_lane lane[SGI_MAX_FIELDS];
+    uint8_t *o = dst, *omax = dst + dst_cap;
+    size_t nrec = n / reclen, r;
+    int nl, i;
+    size_t lawful = 0;
+
+    if (nrec < 16) return 0;
+    nl = bin_layout(src, nrec, reclen, lane, SGI_MAX_FIELDS);
+    if (nl <= 0) return 0;
+
+    for (i = 0; i < nl; ++i)
+        if (lane[i].law != SGI_LAW_RESIDUAL) lawful += lane[i].w;
+    /* need most of the record explained, else the generic engines do better */
+    if (lawful * 2 < reclen) return 0;
+
+    if ((size_t)(omax - o) < 64) return 0;
+    *o++ = SGI_MAGIC;
+    *o++ = SGI_KIND_BIN;
+    sgi_put_v(&o, reclen);
+    sgi_put_v(&o, nrec);
+    sgi_put_v(&o, (uint64_t)nl);
+    sgi_put_v(&o, n);
+
+    for (i = 0; i < nl; ++i) {
+        if ((size_t)(omax - o) < 32) return 0;
+        *o++ = lane[i].off;
+        *o++ = lane[i].w;
+        *o++ = lane[i].law;
+        switch (lane[i].law) {
+            case SGI_LAW_BCONST:
+                sgi_put_v(&o, lane[i].base);
+                break;
+            case SGI_LAW_BCOUNTER:
+                sgi_put_v(&o, lane[i].base);
+                sgi_put_v(&o, lane[i].step);
+                break;
+            case SGI_LAW_BCYCLE:
+                sgi_put_v(&o, lane[i].period);
+                break;
+            default:
+                break;
+        }
+    }
+
+    /* cycle tables: period entries of w bytes each */
+    for (i = 0; i < nl; ++i) {
+        if (lane[i].law != SGI_LAW_BCYCLE) continue;
+        if ((size_t)(omax - o) < (size_t)lane[i].period * lane[i].w + 8) return 0;
+        for (r = 0; r < lane[i].period; ++r) {
+            memcpy(o, src + r * reclen + lane[i].off, lane[i].w);
+            o += lane[i].w;
+        }
+    }
+
+    /* residual lanes, column-wise */
+    for (i = 0; i < nl; ++i) {
+        if (lane[i].law != SGI_LAW_RESIDUAL) continue;
+        if ((size_t)(omax - o) < nrec * lane[i].w + 8) return 0;
+        for (r = 0; r < nrec; ++r) {
+            memcpy(o, src + r * reclen + lane[i].off, lane[i].w);
+            o += lane[i].w;
+        }
+    }
+
+    /* tail: bytes after the last whole record */
+    {
+        size_t tail = n - nrec * reclen;
+        if ((size_t)(omax - o) < tail + 8) return 0;
+        sgi_put_v(&o, tail);
+        memcpy(o, src + nrec * reclen, tail);
+        o += tail;
+    }
+    return (size_t)(o - dst);
+}
+
+static int sgi_bin_decompress(uint8_t *dst, size_t n,
+                              const uint8_t *src, size_t src_size)
+{
+    const uint8_t *p = src, *e = src + src_size;
+    sgi_lane lane[SGI_MAX_FIELDS];
+    const uint8_t *ctab[SGI_MAX_FIELDS];
+    const uint8_t *rescur[SGI_MAX_FIELDS];
+    size_t reclen, nrec, declared, r;
+    int nl, i, err = 0;
+
+    p += 2;                                   /* magic + kind */
+    reclen   = (size_t)sgi_get_v(&p, e, &err);
+    nrec     = (size_t)sgi_get_v(&p, e, &err);
+    nl       = (int)sgi_get_v(&p, e, &err);
+    declared = (size_t)sgi_get_v(&p, e, &err);
+    if (err || nl <= 0 || nl > SGI_MAX_FIELDS) return -1;
+    if (declared != n || reclen == 0 || reclen > 4096) return -1;
+    if (nrec > n / reclen) return -1;
+
+    for (i = 0; i < nl; ++i) {
+        if (p + 3 > e) return -1;
+        lane[i].off = *p++;
+        lane[i].w   = *p++;
+        lane[i].law = *p++;
+        lane[i].base = lane[i].step = 0;
+        lane[i].period = 0;
+        if (lane[i].w < 1 || lane[i].w > 8) return -1;
+        if ((size_t)lane[i].off + lane[i].w > reclen) return -1;
+        switch (lane[i].law) {
+            case SGI_LAW_BCONST:
+                lane[i].base = sgi_get_v(&p, e, &err); break;
+            case SGI_LAW_BCOUNTER:
+                lane[i].base = sgi_get_v(&p, e, &err);
+                lane[i].step = sgi_get_v(&p, e, &err); break;
+            case SGI_LAW_BCYCLE:
+                lane[i].period = (uint32_t)sgi_get_v(&p, e, &err);
+                if (lane[i].period == 0) err = 1;
+                break;
+            case SGI_LAW_RESIDUAL: break;
+            default: return -1;
+        }
+        if (err) return -1;
+    }
+
+    for (i = 0; i < nl; ++i) {
+        if (lane[i].law != SGI_LAW_BCYCLE) continue;
+        if ((size_t)(e - p) < (size_t)lane[i].period * lane[i].w) return -1;
+        ctab[i] = p;
+        p += (size_t)lane[i].period * lane[i].w;
+    }
+    for (i = 0; i < nl; ++i) {
+        if (lane[i].law != SGI_LAW_RESIDUAL) continue;
+        if ((size_t)(e - p) < nrec * lane[i].w) return -1;
+        rescur[i] = p;
+        p += nrec * lane[i].w;
+    }
+
+    if (nrec * reclen > n) return -1;
+    for (r = 0; r < nrec; ++r) {
+        uint8_t *rec = dst + r * reclen;
+        for (i = 0; i < nl; ++i) {
+            uint8_t *f = rec + lane[i].off;
+            int w = lane[i].w;
+            uint64_t mask = (w >= 8) ? ~0ull : ((1ull << (8 * w)) - 1);
+            switch (lane[i].law) {
+                case SGI_LAW_BCONST:
+                    bin_put(f, lane[i].base, w);
+                    break;
+                case SGI_LAW_BCOUNTER:
+                    bin_put(f, (lane[i].base + lane[i].step * (uint64_t)r) & mask, w);
+                    break;
+                case SGI_LAW_BCYCLE:
+                    memcpy(f, ctab[i] + (size_t)(r % lane[i].period) * w, (size_t)w);
+                    break;
+                default:
+                    memcpy(f, rescur[i], (size_t)w);
+                    rescur[i] += w;
+                    break;
+            }
+        }
+    }
+
+    {
+        uint64_t tail = sgi_get_v(&p, e, &err);
+        size_t pos = nrec * reclen;
+        if (err || (size_t)(e - p) < tail || pos + tail != n) return -1;
+        memcpy(dst + pos, p, (size_t)tail);
+    }
+    return 0;
+}
+
 size_t hz_sgi_compress(uint8_t *dst, size_t dst_cap,
                        const uint8_t *src, size_t n, int level)
 {
@@ -739,6 +1099,37 @@ size_t hz_sgi_compress(uint8_t *dst, size_t dst_cap,
     if (n < 4096 || dst_cap < 64) return 0;
 
     induce_layout(src, n, &LO);
+
+    /* Fixed width records get the binary lane fitter first.  The text path
+     * below parses digits, so an integer counter stored as four raw bytes is
+     * invisible to it -- and that is most machine generated binary data. */
+    if (LO.kind == 2 && LO.width >= 1 && LO.width <= 4096) {
+        /* The detector returns the smallest period that pins down columns,
+         * but the true record is often a multiple of it: a 12 byte frame
+         * whose first field is a 4 byte counter looks 4-periodic, because
+         * the counter's low byte alone repeats the pattern.  Try the
+         * detected width and a few multiples, keep whichever fits most of
+         * the record under a law. */
+        static const int MULT[] = { 1, 2, 3, 4, 6, 8, 12, 16 };
+        size_t bestz = 0;
+        int mi;
+        for (mi = 0; mi < (int)(sizeof(MULT) / sizeof(MULT[0])); ++mi) {
+            size_t w = LO.width * (size_t)MULT[mi];
+            size_t bz;
+            if (w < 2 || w > 4096 || w * 16 > n) continue;
+            bz = sgi_bin_compress(dst, dst_cap, src, n, w);
+            if (bz && (bestz == 0 || bz < bestz)) {
+                /* keep the best; re-encode at the end so dst holds it */
+                bestz = bz;
+                LO.reclen_best = w;
+            }
+        }
+        if (bestz) {
+            size_t bz = sgi_bin_compress(dst, dst_cap, src, n, LO.reclen_best);
+            if (bz) return bz;
+        }
+    }
+
     if (LO.kind == 1)      split_ok = split_delimited(src, n, LO.delim, &S);
     else if (LO.kind == 2) split_ok = split_fixed(src, n, LO.width, &S);
     if (!split_ok) return 0;
@@ -933,8 +1324,10 @@ int hz_sgi_decompress(uint8_t *dst, size_t n, const uint8_t *src, size_t src_siz
     uint8_t rsep, fsep;
     uint8_t *o = dst, *oend = dst + n;
 
-    if (src_size < 8 || *p++ != SGI_MAGIC) return -1;
-    kind = *p++; (void)kind;
+    if (src_size < 8 || src[0] != SGI_MAGIC) return -1;
+    if (src[1] == SGI_KIND_BIN) return sgi_bin_decompress(dst, n, src, src_size);
+    p += 2;
+    kind = src[1]; (void)kind;
     rsep = *p++;
     fsep = *p++;
     reclen   = (size_t)sgi_get_v(&p, e, &err);

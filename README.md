@@ -45,6 +45,12 @@ table is a four-line loop. The other engines faithfully compress the
 3. **Law inference** — per column, search a small space of generating laws:
    `CONST`, `CYCLE`, `COUNTER`, `FLOAT_LIN`, `ENUM`. A column with a law
    **costs nothing per record** — its whole contribution is written once.
+   Fixed-width *binary* records get their own fitter, splitting the record
+   into aligned 1/2/4/8-byte lanes and testing each for `BCONST`,
+   `BCOUNTER` (wrapping arithmetic, since real hardware counters wrap) and
+   `BCYCLE`. Sensor frames, network captures and serialised structs carry
+   exactly these laws as raw little-endian integers, invisible to a parser
+   that only reads digits.
 4. **Residual routing** — lawless columns are gathered column-wise and only
    those reach the entropy stage.
 
@@ -60,7 +66,12 @@ output size stops depending on the input size at all:
 |---|---|---|---|---|---|---|
 | telemetry.csv | 16.4 MB | 146x | 5,138x | **21,299x** | 1,018 MB/s | **13,245 MB/s** |
 | metrics.csv | 11.4 MB | 9x | 69x | **4,412x** | 46 MB/s | 907 MB/s |
-| frames.bin | 2.4 MB | 3x | 39x | **4,240x** | 36 MB/s | 525 MB/s |
+| frames.bin (binary lanes) | 2.4 MB | 3x | 39x | **590x** | — | 930 MB/s |
+
+`frames.bin` is `struct { uint32 counter; uint16 cycle; uint16 const;
+float const; }` — every lane lawful, but stored as raw bytes. Before the
+binary fitter existed SGI declined it outright and the generic engines
+reached 39x; now it is 590x, **15x better than xz**.
 
 On prose, photographs or already-compressed data there is no law to find.
 SGI detects this during induction, declines, and the block falls through to
