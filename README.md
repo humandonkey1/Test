@@ -236,6 +236,33 @@ Reversible preprocessing, each an exact bijection:
 - **exe** — x86 E8/E9 relative branch targets to absolute
 - **lrm** — de-duplicate repeats beyond the entropy coder's reach
 
+### Media files: containers are machine generated, samples are not
+
+Photos, audio and video are written by a program, so the question is fair:
+does the grammar inducer apply? Measured on a real WAV (RIFF header plus
+16-bit stereo PCM), a real BMP (54-byte header plus fixed-length rows) and a
+JPEG-shaped file (marker structure plus entropy-coded payload):
+
+| file | gzip -9 | xz -9e | **hydra -7** |
+|---|---|---|---|
+| image.bmp | 23.74x | 37.32x | **35.98x** |
+| audio.wav | 1.07x | 1.63x | **2.03x** |
+| photos.jpg | 1.00x | 1.00x | **1.00x** |
+
+The idea half-holds, and the split is worth stating precisely:
+
+- **The container is lawful.** A BMP is a header followed by rows of exactly
+  3072 bytes; 91% of bytes equal the byte one row above. That is real
+  structure and it is exploitable.
+- **The samples are not.** A WAV's first difference drops from 6858 to 36 —
+  smooth, highly compressible, but no finite rule reproduces it exactly. The
+  microphone recorded the world, not a program's output. Smoothness is for
+  the context models; laws are for SGI.
+- **Already-coded payloads have nothing left.** A JPEG's entropy coder
+  already removed what a second pass could find. 1.00x is the correct answer.
+
+This test caught a real bug and a real gap — see below.
+
 ### `--blind`: choose filters without looking at the data at all
 
 There is a second way to pick filters, and it came from asking a simple
@@ -442,6 +469,18 @@ through the public API and compares byte for byte:
 
 Bugs this suite caught, all of which round-tripped fine on casual input:
 
+- **an unverifiable filter guess defaulted to "apply".** The delta probe was
+  skipped whenever the scratch buffer failed a size check, and the flag it
+  would have set started at 1 — so the filter went on unverified. On a
+  2.25 MiB bitmap that cost 42%: plain coding reaches 36x and the unchecked
+  delta-3 dropped it to 21x. An unverifiable guess now falls back to doing
+  nothing.
+- **delta strides stopped at 16, and the header field was one byte.** A
+  bitmap's correlation is vertical, at row distance — thousands of bytes —
+  so the scan could not see it and settled for a weak horizontal stride.
+  Row-sized strides are now tried, which required widening the filter
+  parameter in the block header to 16 bits and lifting a 16-byte ceiling
+  inside the delta filter itself.
 - **multi-block frames placed blocks at the wrong offset.** The block header
   stored only the length the entropy stage produces, and the decoder used it
   to position the block in the output. For the long range filter, which

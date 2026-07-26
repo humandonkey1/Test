@@ -17,34 +17,28 @@
 #include "hz_int.h"
 
 /* ---- delta -------------------------------------------------------------- */
+/* Subtract the value `stride` bytes back.
+ *
+ * Small strides de-correlate numeric samples; a stride of a whole image row
+ * de-correlates vertically, which is where a bitmap's real redundancy lives.
+ * Both are the same operation, so rather than keeping a rotating window of
+ * previous values the reference is read straight out of the buffer -- which
+ * also removes the old 16 byte ceiling on the stride. */
 void hz_delta_fwd(uint8_t *buf, size_t n, int stride)
 {
     size_t i;
-    uint8_t prev[16];
-    int k = 0;
-    if (stride < 1 || stride > 16) return;
-    memset(prev, 0, sizeof(prev));
-    for (i = 0; i < n; ++i) {
-        uint8_t v = buf[i];
-        buf[i] = (uint8_t)(v - prev[k]);
-        prev[k] = v;
-        if (++k == stride) k = 0;
-    }
+    if (stride < 1 || (size_t)stride >= n) return;
+    /* backwards: each byte must see the original value at i - stride */
+    for (i = n; i-- > (size_t)stride; )
+        buf[i] = (uint8_t)(buf[i] - buf[i - (size_t)stride]);
 }
 
 void hz_delta_rev(uint8_t *buf, size_t n, int stride)
 {
     size_t i;
-    uint8_t prev[16];
-    int k = 0;
-    if (stride < 1 || stride > 16) return;
-    memset(prev, 0, sizeof(prev));
-    for (i = 0; i < n; ++i) {
-        uint8_t v = (uint8_t)(buf[i] + prev[k]);
-        buf[i] = v;
-        prev[k] = v;
-        if (++k == stride) k = 0;
-    }
+    if (stride < 1 || (size_t)stride >= n) return;
+    for (i = (size_t)stride; i < n; ++i)
+        buf[i] = (uint8_t)(buf[i] + buf[i - (size_t)stride]);
 }
 
 /* ---- byte transpose (shuffle) ------------------------------------------
@@ -511,6 +505,29 @@ void hz_analyze(const uint8_t *src, size_t n, hz_analysis *a)
     for (s = 1; s <= 16; ++s) {
         uint64_t sc = residual_entropy(src, n, s);
         if (sc + 8 < best) { best = sc; bs = s; }   /* 8 mbit hysteresis */
+    }
+
+    /* Also try the *row* strides an image format produces.
+     *
+     * A bitmap's real correlation is vertical: a pixel resembles the one
+     * directly above it far more than the one beside it.  That distance is
+     * the row length, thousands of bytes, so a scan of 1..16 cannot see it
+     * and settles for a weak horizontal stride instead.  Common widths are
+     * tried explicitly, and the probe in the frame layer decides. */
+    {
+        static const int ROWS[] = {
+            320*3, 512*3, 640*3, 800*3, 1024*3, 1280*3, 1920*3,
+            320*4, 640*4, 800*4, 1024*4, 1280*4, 1920*4,
+            640, 800, 1024, 1280, 1920, 2048, 3072, 4096
+        };
+        size_t k;
+        for (k = 0; k < sizeof(ROWS) / sizeof(ROWS[0]); ++k) {
+            int rs = ROWS[k];
+            uint64_t sc;
+            if ((size_t)rs * 16 > n) continue;
+            sc = residual_entropy(src, n, rs);
+            if (sc + 64 < best) { best = sc; bs = rs; }   /* wider margin */
+        }
     }
 
     /* Apply it only on a clear win.  Being too eager destroys the byte level

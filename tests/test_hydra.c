@@ -342,6 +342,57 @@ static void gen_binwrap(uint8_t *b, size_t n)
     while (p < n) b[p++] = 0;
 }
 
+/* A bitmap: header plus fixed-length rows, correlated vertically.
+ * The redundancy is at row distance -- thousands of bytes -- not between
+ * adjacent pixels, which is what the wide delta strides exist for. */
+static void gen_bitmap(uint8_t *b, size_t n)
+{
+    size_t w = 320 * 3, y = 0, p = 0;
+    /* a plausible 54-byte header */
+    memcpy(b, "BM", 2);
+    for (p = 2; p < 54 && p < n; ++p) b[p] = (uint8_t)(p * 3);
+    p = 54;
+    while (p + w <= n) {
+        size_t x;
+        for (x = 0; x < w; x += 3) {
+            int v = 120 + (int)((x * 7 + y * 11) % 60) - (int)(y % 17);
+            b[p + x]     = (uint8_t)hz_clampi(v, 0, 255);
+            b[p + x + 1] = (uint8_t)hz_clampi(v - 12, 0, 255);
+            b[p + x + 2] = (uint8_t)hz_clampi(v + 9, 0, 255);
+        }
+        /* a little grain, so it is not trivially constant */
+        b[p + (rnd_below((uint32_t)w))] ^= (uint8_t)(rnd() & 3);
+        p += w;
+        ++y;
+    }
+    while (p < n) b[p++] = 0;
+}
+
+/* A RIFF-style container: real header, then interleaved 16-bit samples. */
+static void gen_wav(uint8_t *b, size_t n)
+{
+    size_t p = 44, i = 0;
+    int32_t l = 0, r = 0, dl = 0, dr = 0;
+    memcpy(b, "RIFF", 4);
+    memcpy(b + 8, "WAVEfmt ", 8);
+    memcpy(b + 36, "data", 4);
+    for (i = 4; i < 8; ++i)  b[i] = (uint8_t)(n >> ((i - 4) * 8));
+    for (i = 16; i < 36; ++i) b[i] = (uint8_t)(i * 5);
+    while (p + 4 <= n) {
+        dl += (int32_t)rnd_below(64) - 32;
+        dr += (int32_t)rnd_below(64) - 32;
+        if (dl > 300) dl = 300; if (dl < -300) dl = -300;
+        if (dr > 300) dr = 300; if (dr < -300) dr = -300;
+        l += dl; r += dr;
+        if (l > 30000 || l < -30000) dl = -dl;
+        if (r > 30000 || r < -30000) dr = -dr;
+        b[p] = (uint8_t)l; b[p + 1] = (uint8_t)(l >> 8);
+        b[p + 2] = (uint8_t)r; b[p + 3] = (uint8_t)(r >> 8);
+        p += 4;
+    }
+    while (p < n) b[p++] = 0;
+}
+
 /* long range duplication: a payload that repeats far apart */
 static void gen_lrm(uint8_t *b, size_t n)
 {
@@ -387,6 +438,8 @@ static void test_generators(void)
         { "binframes", gen_binframes },
         { "binmixed", gen_binmixed },
         { "binwrap",  gen_binwrap  },
+        { "bitmap",   gen_bitmap   },
+        { "wav",      gen_wav      },
         { "semilaw", gen_semi_lawful },
         { "pseudostruct", gen_pseudo_structured },
         { "ragged",  gen_ragged  },

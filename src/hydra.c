@@ -155,20 +155,26 @@ typedef struct {
     uint8_t method;
     uint8_t nfilters;
     uint8_t fid[HZ_MAX_FILTERS];
-    uint8_t fparam[HZ_MAX_FILTERS];
+    /* 16 bits: a delta stride can be a whole image row, thousands of bytes,
+     * which does not fit in the byte this used to be. */
+    uint16_t fparam[HZ_MAX_FILTERS];
     uint32_t usize;   /* length the entropy stage produces (pre-unfilter) */
     uint32_t osize;   /* bytes this block contributes to the final output */
     uint32_t csize;   /* payload length                                   */
 } hz_bhdr;
 
-static size_t bhdr_size(const hz_bhdr *h) { return 2 + 2 * (size_t)h->nfilters + 12; }
+static size_t bhdr_size(const hz_bhdr *h) { return 2 + 3 * (size_t)h->nfilters + 12; }
 
 static void bhdr_write(uint8_t *p, const hz_bhdr *h)
 {
     int i;
     *p++ = h->method;
     *p++ = h->nfilters;
-    for (i = 0; i < h->nfilters; ++i) { *p++ = h->fid[i]; *p++ = h->fparam[i]; }
+    for (i = 0; i < h->nfilters; ++i) {
+        *p++ = h->fid[i];
+        *p++ = (uint8_t)(h->fparam[i] & 0xFF);
+        *p++ = (uint8_t)(h->fparam[i] >> 8);
+    }
     hz_put32le(p, h->usize); p += 4;
     hz_put32le(p, h->osize); p += 4;
     hz_put32le(p, h->csize);
@@ -245,7 +251,7 @@ static size_t hz_recipe_apply(const hz_recipe *r, uint8_t *dst, size_t len,
         if (len < (size_t)r->shuf * 64) return 0;
         hz_shuf_fwd(dst, scratch, len, r->shuf);
         h->fid[h->nfilters] = HZ_F_SHUF;
-        h->fparam[h->nfilters] = r->shuf;
+        h->fparam[h->nfilters] = (uint16_t)r->shuf;
         ++h->nfilters;
     }
     if (r->exe) {
@@ -257,7 +263,7 @@ static size_t hz_recipe_apply(const hz_recipe *r, uint8_t *dst, size_t len,
     if (r->delta) {
         hz_delta_fwd(dst, len, r->delta);
         h->fid[h->nfilters] = HZ_F_DELTA;
-        h->fparam[h->nfilters] = r->delta;
+        h->fparam[h->nfilters] = (uint16_t)r->delta;
         ++h->nfilters;
     }
     return len;
@@ -529,7 +535,7 @@ static void hz_compress_block(void *vctx, int index)
                 if (use_shuf) {
                     hz_shuf_fwd(stage, shufbuf, stage_len, w);
                     h.fid[h.nfilters] = HZ_F_SHUF;
-                    h.fparam[h.nfilters] = (uint8_t)w;
+                    h.fparam[h.nfilters] = (uint16_t)w;
                     ++h.nfilters;
                 }
             }
@@ -546,7 +552,15 @@ static void hz_compress_block(void *vctx, int index)
              * on real data into a decision that is right by construction. */
             if (opts->enable_delta && an.best_delta_stride &&
                 h.nfilters + 1 < HZ_MAX_FILTERS) {
-                int use_delta = 1;
+                /* Default to NOT filtering.
+             *
+             * This started as 1, so whenever the probe could not run -- too
+             * small a slice, or a scratch buffer that did not clear the size
+             * check below -- the filter was applied on the analyser's word
+             * alone.  On a 2.25 MiB bitmap that silently cost 42%: plain
+             * coding reaches 36x and the unverified delta-3 dropped it to
+             * 21x.  An unverifiable guess must fall back to doing nothing. */
+            int use_delta = 0;
                 /* Probe a slice from the middle of the block: the start is
                  * often a header or a warm-up region that behaves nothing like
                  * the bulk, and judging the whole block by it is how the
@@ -577,7 +591,7 @@ static void hz_compress_block(void *vctx, int index)
                 if (use_delta) {
                     hz_delta_fwd(stage, stage_len, an.best_delta_stride);
                     h.fid[h.nfilters] = HZ_F_DELTA;
-                    h.fparam[h.nfilters] = (uint8_t)an.best_delta_stride;
+                    h.fparam[h.nfilters] = (uint16_t)an.best_delta_stride;
                     ++h.nfilters;
                 }
             }
@@ -785,7 +799,7 @@ typedef struct {
     uint8_t        method;
     uint8_t        nfilters;
     uint8_t        fid[HZ_MAX_FILTERS];
-    uint8_t        fparam[HZ_MAX_FILTERS];
+    uint16_t       fparam[HZ_MAX_FILTERS];
     int            err;
 } hz_dblk;
 
@@ -910,10 +924,12 @@ int64_t hydra_decompress(void *dstv, size_t dst_cap,
         if (b.method > HZ_M_SGI || b.nfilters >= HZ_MAX_FILTERS) {
             rc = HYDRA_E_CORRUPT; goto done;
         }
-        if (ip + 2u * b.nfilters + 12u > src_size) { rc = HYDRA_E_CORRUPT; goto done; }
+        if (ip + 3u * b.nfilters + 12u > src_size) { rc = HYDRA_E_CORRUPT; goto done; }
         for (i = 0; i < (int)b.nfilters; ++i) {
             b.fid[i]    = src[ip++];
-            b.fparam[i] = src[ip++];
+            b.fparam[i] = (uint16_t)src[ip];
+            b.fparam[i] |= (uint16_t)((uint16_t)src[ip + 1] << 8);
+            ip += 2;
         }
         b.usize = hz_get32le(src + ip); ip += 4;
         b.osize = hz_get32le(src + ip); ip += 4;
