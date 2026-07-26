@@ -14,7 +14,7 @@ OBJDIR  := build
 BINDIR  := bin
 
 LIBSRC  := $(SRCDIR)/hydra.c $(SRCDIR)/hz_tables.c $(SRCDIR)/hz_model.c \
-           $(SRCDIR)/hz_fast.c $(SRCDIR)/hz_mid.c $(SRCDIR)/hz_cm.c $(SRCDIR)/hz_sgi.c $(SRCDIR)/hz_filter.c
+           $(SRCDIR)/hz_fast.c $(SRCDIR)/hz_mid.c $(SRCDIR)/hz_cm.c $(SRCDIR)/hz_sgi.c $(SRCDIR)/hz_rcd.c $(SRCDIR)/hz_filter.c
 LIBOBJ  := $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(LIBSRC))
 
 BIN     := $(BINDIR)/hydra
@@ -80,3 +80,9 @@ $(BINDIR)/nova: tools/nova.c $(LIB) | $(BINDIR)
 
 $(BINDIR)/seedsearch: tools/seedsearch.c $(LIB) | $(BINDIR)
 	$(CC) $(CFLAGS) -D_POSIX_C_SOURCE=199309L -I$(SRCDIR) $< $(LIB) -o $@ $(LDFLAGS)
+
+$(BINDIR)/rcd_experiment: tools/rcd_experiment.c $(LIB) | $(BINDIR)
+	$(CC) $(CFLAGS) -D_POSIX_C_SOURCE=199309L -I$(SRCDIR) $< $(LIB) -o $@ $(LDFLAGS)
+
+rcd: $(BINDIR)/rcd_experiment
+	./$(BINDIR)/rcd_experiment
