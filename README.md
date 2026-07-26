@@ -212,8 +212,11 @@ Per bit, ten models predict, a gated logistic mixer combines them, and two
 APM stages refine the result.
 
 - orders 1, 2, 3, 4, 6, 8 over a two-way associative hash table
-- two **record-relative** models: the byte at the same offset in the previous
-  record, and that byte paired with the position within the record. On fixed
+- three **record-relative** models: a rolling hash of the previous record's
+  high bytes, the aligned byte at the same offset, and that byte paired with
+  the position within the record. Hashing only the high half matters — in a
+  little-endian numeric record the low bytes are close to noise, and folding
+  them in splits one useful context into thousands of near-duplicates. On fixed
   width data the strongest predictor is the value one record back, not one
   byte back — on a quantised sensor series, order-1 over whole 8-byte words
   costs 1.37 bits per value while byte contexts spend nearly three times

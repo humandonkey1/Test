@@ -32,7 +32,7 @@
  * two record-relative models keyed on the previous record's bytes.
  * Mixer inputs: those 8, plus direct order-0 and order-1, plus the match
  * prediction, a match-length term and a constant bias. */
-#define HZ_NHASH    10
+#define HZ_NHASH    11
 #define HZ_NMIXIN   (HZ_NHASH + 5)
 
 /* A slot covers one *nibble* of the byte tree: 4 bits form 15 internal
@@ -133,6 +133,7 @@ typedef struct {
     uint32_t wordhash;
     uint32_t rec_stride;  /* detected record width, 0 = unknown */
     uint32_t rec_pos;     /* byte offset within the current record */
+    uint64_t rec_hash;    /* digest of the whole previous record   */
     int      c0;          /* current partial byte, with a leading 1 bit */
     int      bitpos;
 
@@ -251,15 +252,31 @@ static int hz_cm_geometry(int level, size_t hsize)
 {
     int htbits, cap;
 
-    if      (level <= 4) htbits = 20;
-    else if (level <= 6) htbits = 22;
-    else if (level <= 8) htbits = 23;
-    else                 htbits = 24;
+    /* Slots per level.  These are budgets for the *whole* model, and with
+     * eleven contexts each inserting per position a level needs roughly
+     * eleven slots per input byte before eviction stops hurting. */
+    if      (level <= 4) htbits = 21;
+    else if (level <= 6) htbits = 23;
+    else if (level <= 8) htbits = 25;
+    else                 htbits = 26;
 
-    /* smallest power of two that covers the input, plus one doubling */
+    /* Smallest power of two covering the input, plus headroom.
+     *
+     * The cap has to scale with the number of *contexts*, not just the
+     * input: every model inserts its own entry per position, so N models
+     * over n bytes want room for N*n slots, not n.  When two record-aware
+     * contexts were added the table silently became 1.4x more crowded, and
+     * the symptom was ugly -- cost per value climbing from 1.77 bits at
+     * 12k values to 2.70 at 400k, a model getting *worse* as it saw more
+     * data, which is exactly what eviction thrash looks like. */
     cap = 16;
     while (cap < 26 && ((size_t)1 << cap) < hsize) ++cap;
-    cap += 1;
+    cap += 2;
+    {
+        /* one extra doubling per four contexts beyond the original eight */
+        int extra = (HZ_NHASH - 8 + 3) / 4;
+        cap += extra;
+    }
     if (htbits > cap) htbits = cap;
     if (htbits < 16) htbits = 16;
     if (htbits > 26) htbits = 26;
@@ -294,17 +311,24 @@ static void hz_cm_refresh(hz_cm *m, int nib, int highnib)
     /* Record-relative contexts.
      *
      * On an array of fixed width values -- floats, structs, samples -- the
-     * strongest predictor of a byte is the byte at the same offset in the
-     * previous record, not the byte immediately before it.  A quantised
-     * sensor series makes the gap stark: order-1 over whole 8-byte words
-     * costs 1.37 bits per value while the byte models spend nearly three
-     * times that, because the law lives at the width of the record and the
-     * byte contexts can only see across it by accident.
+     * strongest predictor of a byte is not the byte before it but the
+     * corresponding byte one record back.
      *
-     * Two contexts are added: the aligned byte from the previous record,
-     * and that byte paired with the position within the record.  Both fall
-     * back to plain order-1 behaviour when no stride has been detected, so
-     * they cost nothing on data that is not tabular. */
+     * The first version of this hashed a single aligned byte, and that was
+     * not enough.  Measured on a quantised sensor series: order-1 over
+     * *whole* 8-byte words costs 1.37 bits per value, while a model keyed
+     * on one byte of the previous word was still spending nearly three
+     * times that.  The law relates entire values, so the context has to be
+     * the entire previous value.
+     *
+     * Three contexts now:
+     *   - the whole previous record, rolled into one hash, plus position
+     *   - the aligned byte alone, which stays useful when records are long
+     *     and only the nearby column matters
+     *   - the aligned byte paired with the byte just coded
+     *
+     * m->rec_hash carries the rolling digest of the previous record; it is
+     * recomputed once per record boundary rather than per byte. */
     {
         uint32_t st = m->rec_stride;
         uint32_t prevb = 0, posn = 0;
@@ -312,6 +336,9 @@ static void hz_cm_refresh(hz_cm *m, int nib, int highnib)
             prevb = m->hist[m->hpos - st];
             posn  = m->rec_pos;
         }
+        m->chash[k++] = hz_hash8(m->rec_hash * HZ_PRIME64_1
+                                 + (uint64_t)posn * 0x9E3779B9u
+                                 + 29u + salt, m->ht.bits);
         m->chash[k++] = hz_hash4(prevb * 2654435761u + posn * 40503u
                                  + 17u + salt, m->ht.bits);
         m->chash[k++] = hz_hash4((prevb | ((m->c4 & 0xFF) << 8)
@@ -396,7 +423,7 @@ HZ_INLINE int hz_cm_predict(hz_cm *m)
      * so they are fed a neutral zero instead -- the mixer then learns to
      * ignore them at no cost, and text is unaffected. */
     for (i = 0; i < HZ_NHASH; ++i) {
-        if (i >= HZ_NHASH - 2 && !m->rec_stride) {
+        if (i >= HZ_NHASH - 3 && !m->rec_stride) {
             hz_mixer_add_st(&m->mx, 0);
         } else {
             uint8_t st = m->cstate[i][ti];
@@ -463,7 +490,7 @@ HZ_INLINE void hz_cm_update(hz_cm *m, int bit)
 
     for (i = 0; i < HZ_NHASH; ++i) {
         uint8_t *st;
-        if (i >= HZ_NHASH - 2 && !m->rec_stride) continue;
+        if (i >= HZ_NHASH - 3 && !m->rec_stride) continue;
         st = &m->cstate[i][ti];
         hz_ctr_update(&m->sm[i].p[*st], bit, 255);
         *st = hz_state_next[*st][bit];
@@ -504,7 +531,32 @@ HZ_INLINE void hz_cm_push_byte(hz_cm *m, int c)
     m->bitpos = 0;
     ++m->hpos;
     if (m->rec_stride) {
-        if (++m->rec_pos >= m->rec_stride) m->rec_pos = 0;
+        if (++m->rec_pos >= m->rec_stride) {
+            m->rec_pos = 0;
+            /* A record just completed: fold it into one value that the next
+             * record can be predicted from.  Reading it back out of the
+             * history costs one pass per record, not per byte. */
+            if (m->hpos >= m->rec_stride) {
+                /* Fold only the *high* portion of the record.
+                 *
+                 * In a little endian numeric record the low bytes are the
+                 * least significant digits, and on measured data they are
+                 * close to noise: hashing them splits one useful context
+                 * into thousands of near-duplicates that each see too few
+                 * observations to become confident.  Measured on a
+                 * quantised sensor series, a context built from the top
+                 * three bytes of the previous value predicts exactly as
+                 * well as one built from all eight -- and it concentrates
+                 * the statistics instead of scattering them. */
+                const uint8_t *rp = m->hist + m->hpos - m->rec_stride;
+                uint32_t keep = m->rec_stride > 4 ? m->rec_stride / 2 : m->rec_stride;
+                uint64_t h = 0;
+                uint32_t j;
+                for (j = m->rec_stride - keep; j < m->rec_stride; ++j)
+                    h = hz_mix64(h ^ ((uint64_t)rp[j] + 0x9E3779B97F4A7C15ull));
+                m->rec_hash = h;
+            }
+        }
     }
     hz_cm_match_update(m);
     hz_cm_refresh(m, 0, 0);
